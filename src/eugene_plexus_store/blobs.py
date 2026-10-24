@@ -44,6 +44,13 @@ class Written:
     md5: str
 
 
+@dataclass(frozen=True)
+class Digest:
+    size: int
+    sha256: str
+    md5: str
+
+
 class Blobs:
     def __init__(self, folder: Path) -> None:
         self.root = folder / "blobs"
@@ -86,6 +93,19 @@ class Blobs:
             self.discard(path)
             raise
         return Written(path, size, sha.hexdigest(), md5.hexdigest())
+
+    @staticmethod
+    def digest(sources: Iterable[Iterable[bytes]]) -> Digest:
+        """Size and digests of the bytes, read and not written anywhere."""
+        sha = hashlib.sha256()
+        md5 = hashlib.md5(usedforsecurity=False)
+        size = 0
+        for chunks in sources:
+            for chunk in chunks:
+                sha.update(chunk)
+                md5.update(chunk)
+                size += len(chunk)
+        return Digest(size, sha.hexdigest(), md5.hexdigest())
 
     def keep(self, written: Written) -> bool:
         """Move a written temp file into place as its blob. False when the

@@ -50,7 +50,8 @@ def _schema_1(connection: sqlite3.Connection) -> None:
             mime_type TEXT NOT NULL,
             sha256 TEXT NOT NULL,
             created_at INTEGER NOT NULL,
-            expires_at INTEGER NOT NULL
+            expires_at INTEGER,
+            generation INTEGER NOT NULL
         );
         CREATE INDEX files_by_owner ON files(owner, created_at, id);
         CREATE INDEX files_by_end ON files(expires_at);
@@ -66,8 +67,14 @@ def _schema_1(connection: sqlite3.Connection) -> None:
             expires_at INTEGER NOT NULL,
             file_seconds INTEGER,
             status TEXT NOT NULL,
-            file_id TEXT
+            file_id TEXT,
+            generation INTEGER NOT NULL
         );
+        CREATE TABLE counters (
+            name TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        );
+        INSERT INTO counters (name, value) VALUES ('generation', 0);
         CREATE INDEX uploads_by_owner ON uploads(owner);
         CREATE INDEX uploads_by_end ON uploads(expires_at);
         CREATE TABLE parts (

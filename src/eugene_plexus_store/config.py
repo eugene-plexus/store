@@ -54,28 +54,17 @@ FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="fileDefaultDays",
-        label="Keep a file for (days)",
+        label="Delete a file after (days)",
         description=(
-            "How long a file is kept when the app that uploaded it does not say. Then it "
-            "is deleted for good."
+            "How long a file is kept when the app that uploaded it does not say, then "
+            "deleted for good.\n\n"
+            "0 keeps it until it is deleted, as OpenAI does. An app can always ask for an "
+            "end of its own (OpenAI's `expires_after`, one hour to 30 days)."
         ),
         category="files",
         valueType=ConfigValueType.integer,
-        default=30,
-        minimum=1,
-        maximum=3650,
-    ),
-    ConfigField(
-        key="fileMaxDays",
-        label="Longest an app may ask (days)",
-        description=(
-            "The longest an app may ask for a file to be kept (OpenAI's `expires_after`). "
-            "A longer request is refused. OpenAI's own limit is 30 days."
-        ),
-        category="files",
-        valueType=ConfigValueType.integer,
-        default=30,
-        minimum=1,
+        default=0,
+        minimum=0,
         maximum=3650,
     ),
     ConfigField(
@@ -267,11 +256,10 @@ class ConfigStore:
     def files_enabled(self) -> bool:
         return bool(self.get("filesEnabled"))
 
-    def default_seconds(self) -> int:
-        return int(self.get("fileDefaultDays")) * DAY
-
-    def max_seconds(self) -> int:
-        return int(self.get("fileMaxDays")) * DAY
+    def default_seconds(self) -> int | None:
+        """A file's life when its app names none; None keeps it until deleted."""
+        days = int(self.get("fileDefaultDays"))
+        return days * DAY if days > 0 else None
 
     def quota_bytes(self) -> int:
         return int(self.get("ownerQuotaGiB")) * GIB

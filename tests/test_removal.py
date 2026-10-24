@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import httpx
 from fastapi.testclient import TestClient
 
 from eugene_plexus_store.settings import Settings
@@ -86,3 +87,37 @@ def test_a_root_that_cannot_be_asked_deletes_nothing(
     assert as_owner("person:alice").get(f"/v1/files/{hers}").status_code == 200
     refused = client.post("/v1/removals/release", headers=operator)
     assert refused.status_code == 200  # nothing held, nothing asked
+
+
+def test_a_person_restored_during_the_check_keeps_what_they_keep_after_it(
+    client: TestClient,
+    as_owner: Callable[[str], Caller],
+    operator: dict[str, str],
+    agent: AgentStub,
+) -> None:
+    """The root's answer is fenced by generation: only what is older than the
+    question is deleted (review of row 53)."""
+    alice = as_owner("person:alice")
+    old = alice.upload(b"before").json()["id"]
+    keeper = client.app.state.keeper  # type: ignore[attr-defined]
+    made: dict[str, str] = {}
+    answer = agent.handler
+
+    def restored_meanwhile(request: httpx.Request) -> httpx.Response:
+        # Alice is restored under her id and keeps a file while the root answers.
+        made["new"] = keeper.create_file(
+            "person:alice",
+            filename="after.txt",
+            purpose="user_data",
+            mime_type=None,
+            expires_after=None,
+            chunks=[b"after"],
+        )["id"]
+        return answer(request)
+
+    client.app.state.sweeper.people._client._transport = httpx.MockTransport(restored_meanwhile)  # type: ignore[attr-defined]
+    agent.removed = {"alice"}
+    report = client.post("/v1/sweep", headers=operator).json()
+    assert report["removal"]["removed"] == 1
+    assert alice.get(f"/v1/files/{old}").status_code == 404
+    assert alice.get(f"/v1/files/{made['new']}").status_code == 200

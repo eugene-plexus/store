@@ -78,6 +78,10 @@ class Sweeper:
         removal: dict[str, Any] = {"checked": len(owners), "removed": 0, "held": sorted(held)}
         if not owners:
             return removal
+        # Read before the root is asked: only what is older than its answer is
+        # deleted, so a person restored under the same id keeps what they keep
+        # after it (review of row 53).
+        fence = await run_in_threadpool(self.keeper.generation)
         try:
             known, unknown = await self.people.unknown(owners)
         except AskFailed as exc:
@@ -100,7 +104,7 @@ class Sweeper:
                 brake,
             )
         elif new:
-            removed = await run_in_threadpool(self.keeper.remove_owners, new)
+            removed = await run_in_threadpool(lambda: self.keeper.remove_owners(new, fence=fence))
             counts.add(removed)
             removal["removed"] = len(new)
             log.info("deleted everything %d removed people kept here", len(new))
@@ -115,11 +119,14 @@ class Sweeper:
             removal: dict[str, Any] = {"checked": len(held), "removed": 0, "held": []}
             counts = SweepCounts()
             if held:
+                fence = await run_in_threadpool(self.keeper.generation)
                 known, unknown = await self.people.unknown(held)
                 if known:
                     await run_in_threadpool(self.keeper.unhold, known)
                 if unknown:
-                    counts = await run_in_threadpool(self.keeper.remove_owners, unknown)
+                    counts = await run_in_threadpool(
+                        lambda: self.keeper.remove_owners(unknown, fence=fence)
+                    )
                     removal["removed"] = len(unknown)
             report = report_of(counts, at=started, removal=removal)
             await run_in_threadpool(self.keeper.save_report, report)

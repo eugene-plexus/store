@@ -23,7 +23,7 @@ def test_a_bad_config_file_degrades_and_the_config_stays_reachable(
         assert health["status"] == "degraded"
         assert "fileDefaultDays" in health["details"]["error"]
         headers = {"Authorization": f"Bearer {install.session()}"}
-        assert client.get("/v1/config", headers=headers).json()["fileDefaultDays"] == 30
+        assert client.get("/v1/config", headers=headers).json()["fileDefaultDays"] == 0
         fixed = client.patch("/v1/config", json={"fileDefaultDays": 7}, headers=headers)
         assert fixed.json()["applied"] == ["fileDefaultDays"]
 

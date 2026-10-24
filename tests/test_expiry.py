@@ -28,7 +28,8 @@ def test_expired_files_are_deleted_by_the_sweep(
     short = alice.upload(b"gone soon", expiresAfterSeconds=1).json()
     kept = alice.upload(b"stays").json()
     assert short["expiresAt"] == short["createdAt"] + 1
-    assert kept["expiresAt"] == kept["createdAt"] + 30 * 86400
+    # No end unless an app asks for one, as OpenAI keeps files until deleted.
+    assert "expiresAt" not in kept
     assert len(blob_files(settings)) == 2
 
     clock.advance(2)
