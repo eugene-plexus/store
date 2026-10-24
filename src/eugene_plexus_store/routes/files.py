@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request, status
@@ -26,6 +28,19 @@ def _keeper(request: Request) -> Keeper:
             f"The store cannot keep or read anything: {cause}.",
         )
     return keeper
+
+
+@contextlib.asynccontextmanager
+async def _admitted(request: Request, owner: str) -> AsyncIterator[None]:
+    """A write is busy for its owner from admission, before a byte of its body is read,
+    and refused there for a hidden or deleted owner (third review of row 53): a
+    removal waits for a body still arriving, and none starts after it."""
+    keeper = _keeper(request)
+    await _call(keeper.begin_write, owner)
+    try:
+        yield
+    finally:
+        keeper.end_write(owner)
 
 
 async def read_capped(request: Request, limit: int = MAX_BODY_BYTES) -> list[bytes]:
@@ -71,16 +86,17 @@ async def create_file(
     caller: Caller = Depends(require_owner),
 ) -> JSONResponse:
     keeper = _keeper(request)
-    chunks = await read_capped(request)
-    kept = await _call(
-        keeper.create_file,
-        caller.owner,
-        filename=filename,
-        purpose=purpose,
-        mime_type=mimeType,
-        expires_after=expiresAfterSeconds,
-        chunks=chunks,
-    )
+    async with _admitted(request, caller.owner):
+        chunks = await read_capped(request)
+        kept = await _call(
+            keeper.create_file,
+            caller.owner,
+            filename=filename,
+            purpose=purpose,
+            mime_type=mimeType,
+            expires_after=expiresAfterSeconds,
+            chunks=chunks,
+        )
     return JSONResponse(kept, status_code=201)
 
 
@@ -136,16 +152,17 @@ async def file_content(
 @router.post("/v1/uploads", status_code=201)
 async def create_upload(request: Request, caller: Caller = Depends(require_owner)) -> JSONResponse:
     keeper = _keeper(request)
-    body = await _json(request)
-    kept = await _call(
-        keeper.create_upload,
-        caller.owner,
-        filename=_text(body, "filename"),
-        purpose=_text(body, "purpose"),
-        size=_integer(body, "bytes"),
-        mime_type=_optional_text(body, "mimeType"),
-        expires_after=_optional_integer(body, "expiresAfterSeconds"),
-    )
+    async with _admitted(request, caller.owner):
+        body = await _json(request)
+        kept = await _call(
+            keeper.create_upload,
+            caller.owner,
+            filename=_text(body, "filename"),
+            purpose=_text(body, "purpose"),
+            size=_integer(body, "bytes"),
+            mime_type=_optional_text(body, "mimeType"),
+            expires_after=_optional_integer(body, "expiresAfterSeconds"),
+        )
     return JSONResponse(kept, status_code=201)
 
 
@@ -154,8 +171,9 @@ async def add_part(
     request: Request, upload_id: str, caller: Caller = Depends(require_owner)
 ) -> JSONResponse:
     keeper = _keeper(request)
-    chunks = await read_capped(request)
-    part = await _call(keeper.add_part, caller.owner, upload_id, chunks)
+    async with _admitted(request, caller.owner):
+        chunks = await read_capped(request)
+        part = await _call(keeper.add_part, caller.owner, upload_id, chunks)
     return JSONResponse(part, status_code=201)
 
 
@@ -164,18 +182,19 @@ async def complete_upload(
     request: Request, upload_id: str, caller: Caller = Depends(require_owner)
 ) -> Any:
     keeper = _keeper(request)
-    body = await _json(request)
-    parts = body.get("partIds")
-    if not isinstance(parts, list) or not all(isinstance(p, str) for p in parts):
-        raise problem(400, "Bad parts", "partIds: a list of part ids, in order.")
-    return await _call(
-        keeper.complete_upload,
-        caller.owner,
-        upload_id,
-        part_ids=parts,
-        md5=_optional_text(body, "md5"),
-        sha256=_optional_text(body, "sha256"),
-    )
+    async with _admitted(request, caller.owner):
+        body = await _json(request)
+        parts = body.get("partIds")
+        if not isinstance(parts, list) or not all(isinstance(p, str) for p in parts):
+            raise problem(400, "Bad parts", "partIds: a list of part ids, in order.")
+        return await _call(
+            keeper.complete_upload,
+            caller.owner,
+            upload_id,
+            part_ids=parts,
+            md5=_optional_text(body, "md5"),
+            sha256=_optional_text(body, "sha256"),
+        )
 
 
 @router.post("/v1/uploads/{upload_id}/cancel")

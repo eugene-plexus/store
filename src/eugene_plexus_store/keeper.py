@@ -43,6 +43,14 @@ after it changes nothing. Deletion is compare-and-delete on the marker's own
 generation, so an answer that is stale by the time it is used cannot delete a
 person restored meanwhile.
 
+**A write is busy from admission, not from its body** (third review): the
+routes call `begin_write` before they read a byte of the body, which counts
+the write for its owner and refuses a hidden or deleted owner on the spot.
+**A deleted person leaves a tombstone**: once everything is gone the marker
+becomes state `deleted` (the id and the date, no bytes), never removed. A
+removed person's id is never reused, so it never blocks a real person; every
+commit refuses a hidden or deleted owner.
+
 **Deletion is fenced by generation.** Every file and upload carries the
 store's generation counter at its making. The sweep reads the counter
 before it asks the root who was removed, and deletes only what is older:
@@ -102,8 +110,8 @@ def _removed() -> StoreProblem:
     return StoreProblem(
         403,
         "Removed",
-        "Eugene removed this person: what they kept here is hidden, and nothing new "
-        "is kept for them unless Eugene has them again.",
+        "Eugene removed this person: what they kept here is hidden or deleted, and nothing "
+        "new is kept for them.",
     )
 
 
@@ -340,6 +348,20 @@ class Keeper:
             if not self._busy[owner]:
                 del self._busy[owner]
             self._guard.notify_all()
+
+    def begin_write(self, owner: str) -> None:
+        """A write for `owner` is admitted: refused for a hidden or deleted owner, else
+        counted busy until `end_write`. Called before the body is read, so a deletion
+        waits for a body still arriving, and none starts after the removal."""
+        self.check_owner(owner)
+        with self.database.lock:
+            if self._is_removed(owner):
+                raise _removed()
+            with self._guard:
+                self._enter(owner)
+
+    def end_write(self, owner: str) -> None:
+        self._leave(owner)
 
     def _wait_idle(self, owner: str) -> bool:
         deadline = time.perf_counter() + self.idle_wait_seconds
@@ -919,6 +941,12 @@ class Keeper:
                         404, "Not removed", f"{owner} is not a person Eugene removed."
                     )
                 return None
+            if row["state"] == "deleted":
+                if marker is None:
+                    raise StoreProblem(
+                        404, "Not removed", f"{owner}'s files here are already deleted."
+                    )
+                return None
             if marker is not None and row["marker"] != marker:
                 return None
             if force:
@@ -948,9 +976,23 @@ class Keeper:
                 f"not be purged: {exc}. They stay removed, and the next sweep tries again.",
             ) from exc
         with self.database.transaction() as connection:
-            connection.execute(
-                "DELETE FROM removed WHERE owner = ? AND marker = ?", (owner, marker)
-            )
+            left = connection.execute(
+                "SELECT 1 FROM files WHERE owner = ? UNION ALL "
+                "SELECT 1 FROM uploads WHERE owner = ? LIMIT 1",
+                (owner, owner),
+            ).fetchone()
+            if left is not None:
+                # Something newer than the fence survived: the person is back (a stale
+                # answer deleted them), so there is nothing to keep tombstoned.
+                connection.execute(
+                    "DELETE FROM removed WHERE owner = ? AND marker = ?", (owner, marker)
+                )
+            else:
+                connection.execute(
+                    "UPDATE removed SET state = 'deleted', delete_at = ? "
+                    "WHERE owner = ? AND marker = ?",
+                    (self.now(), owner, marker),
+                )
         return counts
 
     def delete_now(self, owner: str) -> SweepCounts:
@@ -969,7 +1011,7 @@ class Keeper:
             rows = self.database.connection.execute(
                 "SELECT owner FROM files WHERE owner LIKE 'person:%' "
                 "UNION SELECT owner FROM uploads WHERE owner LIKE 'person:%' "
-                "UNION SELECT owner FROM removed ORDER BY 1"
+                "UNION SELECT owner FROM removed WHERE state = 'hidden' ORDER BY 1"
             ).fetchall()
         return [row[0] for row in rows]
 
@@ -988,7 +1030,9 @@ class Keeper:
                     "deleteAt": row["delete_at"],
                     "marker": row["marker"],
                 }
-                for row in self.database.connection.execute("SELECT * FROM removed")
+                for row in self.database.connection.execute(
+                    "SELECT * FROM removed WHERE state = 'hidden'"
+                )
             }
 
     def hide(self, owners: list[str], seconds: int) -> list[str]:
@@ -1017,7 +1061,8 @@ class Keeper:
         with self.database.transaction() as connection:
             for owner in owners:
                 cursor = connection.execute(
-                    "DELETE FROM removed WHERE owner = ? AND delete_at > ?", (owner, now)
+                    "DELETE FROM removed WHERE owner = ? AND delete_at > ? AND state = 'hidden'",
+                    (owner, now),
                 )
                 if cursor.rowcount:
                     restored.append(owner)
@@ -1044,7 +1089,7 @@ class Keeper:
                 "SELECT COALESCE(SUM(bytes), 0) FROM "
                 "(SELECT sha256, MAX(bytes) AS bytes FROM files GROUP BY sha256)"
             ).fetchone()[0]
-            for row in connection.execute("SELECT * FROM removed"):
+            for row in connection.execute("SELECT * FROM removed WHERE state = 'hidden'"):
                 if row["owner"] in found:
                     found[row["owner"]]["removedAt"] = row["found_at"]
                     found[row["owner"]]["deleteAt"] = row["delete_at"]

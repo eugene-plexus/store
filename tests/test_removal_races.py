@@ -9,6 +9,7 @@ certain, not likely.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import sqlite3
 import threading
@@ -384,3 +385,159 @@ def test_a_marker_that_is_gone_deletes_nothing(keeper: Keeper, settings: Setting
     # The marker is gone with the deletion: naming it again deletes nothing.
     assert keeper.delete_removed(ALICE, marker=seen) is None
     assert blob_files(settings) == []
+
+
+# --- third review: a write still receiving its body, and the "deleted" tombstone ---------
+
+
+def _late_post(
+    app: Any, headers: dict[str, str], gate: asyncio.Event, after_first_chunk: threading.Event
+) -> Any:
+    """`POST /v1/files` for Alice whose body stops after one chunk until `gate` is set."""
+
+    async def body() -> Any:
+        yield b"late "
+        after_first_chunk.set()
+        await gate.wait()
+        yield b"words"
+
+    async def post(client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
+            "/v1/files",
+            params={"filename": "late.txt", "purpose": "user_data"},
+            content=body(),
+            headers={**headers, "Content-Type": "application/octet-stream"},
+        )
+
+    return post
+
+
+def _nothing_left(
+    keeper: Keeper, settings: Settings, as_owner: Callable[[str], Caller], operator: dict[str, str]
+) -> None:
+    assert as_owner(ALICE).get("/v1/files").json()["data"] == []
+    assert blob_files(settings) == []
+    assert _staged(settings) == []
+    assert keeper._used(ALICE) == (0, 0)
+
+
+def test_a_write_that_starts_while_delete_now_waits_is_refused_before_its_body_is_read(
+    client: TestClient,
+    as_owner: Callable[[str], Caller],
+    operator: dict[str, str],
+    keeper: Keeper,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex's sequence: pause writer A, hide Alice, start Delete now, start writer B
+    during its wait and hold B's body, release A, release B's body."""
+    inside, release = threading.Event(), threading.Event()
+    original = blobs_module.Blobs.write_temp
+    state = {"first": True}
+
+    def held(self: Any, chunks: Any) -> Any:
+        if state["first"]:
+            state["first"] = False
+            inside.set()
+            assert release.wait(10)
+        return original(self, chunks)
+
+    monkeypatch.setattr(blobs_module.Blobs, "write_temp", held)
+    results: dict[str, Any] = {}
+    writer = _run(lambda: _create(keeper), results, "A")
+    assert inside.wait(10)
+    keeper.hide([ALICE], 30 * DAY)
+    deleter = _run(lambda: keeper.delete_now(ALICE), results, "delete")
+    time.sleep(0.3)
+    assert deleter.is_alive()
+
+    async def scenario() -> tuple[int, int]:
+        gate = asyncio.Event()
+        chunk = threading.Event()
+        post = _late_post(client.app, as_owner(ALICE).headers, gate, chunk)
+        transport = httpx.ASGITransport(app=client.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://store") as c:
+            task = asyncio.ensure_future(post(c))
+            # Refused at admission: the answer comes while B's body is still held.
+            done, _ = await asyncio.wait({task}, timeout=5)
+            early = task.result().status_code if done else 0
+            release.set()
+            await asyncio.to_thread(writer.join, 10)
+            await asyncio.to_thread(deleter.join, 10)
+            gate.set()
+            late = (await task).status_code if not done else early
+            return early, late
+
+    early, late = asyncio.run(scenario())
+    assert early == 403, "the write was not refused until its body had been read"
+    assert late == 403
+    assert not isinstance(results["delete"], Exception), results["delete"]
+    _nothing_left(keeper, settings, as_owner, operator)
+
+
+def test_a_write_admitted_before_the_removal_is_waited_for_while_its_body_arrives(
+    client: TestClient,
+    as_owner: Callable[[str], Caller],
+    operator: dict[str, str],
+    keeper: Keeper,
+    settings: Settings,
+) -> None:
+    results: dict[str, Any] = {}
+
+    async def scenario() -> int:
+        gate = asyncio.Event()
+        chunk = threading.Event()
+        post = _late_post(client.app, as_owner(ALICE).headers, gate, chunk)
+        transport = httpx.ASGITransport(app=client.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://store") as c:
+            task = asyncio.ensure_future(post(c))
+            for _ in range(500):
+                if keeper._busy.get(ALICE):
+                    break
+                await asyncio.sleep(0.01)
+            assert keeper._busy.get(ALICE), "the write was not busy while its body arrived"
+            keeper.hide([ALICE], 30 * DAY)
+            deleter = _run(lambda: keeper.delete_now(ALICE), results, "delete")
+            await asyncio.sleep(0.3)
+            assert deleter.is_alive(), "Delete now did not wait for a body still arriving"
+            gate.set()
+            answer = await task
+            await asyncio.to_thread(deleter.join, 10)
+            return answer.status_code
+
+    assert asyncio.run(scenario()) == 403
+    assert not isinstance(results["delete"], Exception), results["delete"]
+    _nothing_left(keeper, settings, as_owner, operator)
+
+
+def test_a_deleted_person_stays_deleted_and_no_commit_goes_through_for_them(
+    client: TestClient,
+    as_owner: Callable[[str], Caller],
+    operator: dict[str, str],
+    agent: AgentStub,
+    keeper: Keeper,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create(keeper, b"kept")
+    keeper.hide([ALICE], 30 * DAY)
+    keeper.delete_now(ALICE)
+    # The tombstone is the id and a date, no bytes; it is not a person to ask the root about.
+    assert blob_files(settings) == []
+    assert keeper.person_owners() == []
+    assert keeper.restore([ALICE]) == []
+    assert keeper.hide([ALICE], 0) == []
+    # A commit that got past every earlier check is still refused in its own transaction.
+    monkeypatch.setattr(Keeper, "_check_quota", lambda *args, **kw: None)
+    with pytest.raises(StoreProblem) as raised:
+        _create(keeper, b"after the deletion")
+    assert raised.value.status == 403
+    assert blob_files(settings) == []
+    assert _staged(settings) == []
+    again = client.post("/v1/removals/delete", headers=operator, json={"owner": ALICE})
+    assert again.status_code == 404, again.text
+    assert "already deleted" in again.text
+    # The sweep does not ask the root about it, nor does its date bring it back.
+    agent.removed = set()
+    client.post("/v1/sweep", headers=operator)
+    assert agent.asked == []

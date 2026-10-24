@@ -100,7 +100,8 @@ def _schema_1(connection: sqlite3.Connection) -> None:
             owner TEXT PRIMARY KEY,
             found_at INTEGER NOT NULL,
             delete_at INTEGER NOT NULL,
-            marker INTEGER NOT NULL
+            marker INTEGER NOT NULL,
+            state TEXT NOT NULL DEFAULT 'hidden' CHECK (state IN ('hidden', 'deleted'))
         );
         CREATE TABLE sweeps (
             id INTEGER PRIMARY KEY CHECK (id = 1),

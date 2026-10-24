@@ -30,14 +30,19 @@ def _owners(client: TestClient, operator: dict[str, str]) -> dict[str, dict[str,
     return {entry["owner"]: entry for entry in listed.json()["owners"]}
 
 
-def _rows(settings: Settings, owner: str, path: str | None = None) -> int:
+OBJECTS = ("files", "uploads", "parts")
+
+
+def _rows(
+    settings: Settings, owner: str, path: str | None = None, tables: tuple[str, ...] = OBJECTS
+) -> int:
     database = sqlite3.connect(path or settings.data_folder() / "store.sqlite3")
     try:
         return sum(
             database.execute(f"SELECT COUNT(*) FROM {table} WHERE owner = ?", (owner,)).fetchone()[
                 0
             ]
-            for table in ("files", "uploads", "parts", "removed")
+            for table in tables
         )
     finally:
         database.close()
@@ -79,10 +84,12 @@ def test_a_removed_persons_objects_are_hidden_from_everyone_at_once(
         alice.get(f"/v1/files/{hers}/content"),
         alice.delete(f"/v1/files/{hers}"),
         alice.get(f"/v1/uploads/{upload}"),
-        alice.post(f"/v1/uploads/{upload}/parts", content=b"cd"),
         alice.post(f"/v1/uploads/{upload}/cancel"),
     ):
         assert answer.status_code == 404, answer.text
+    # A write for her is refused at admission, before its body is read.
+    part = alice.post(f"/v1/uploads/{upload}/parts", content=b"cd")
+    assert part.status_code == 403, part.text
     assert alice.get("/v1/files").json()["data"] == []
     # Nothing new is kept for her while she is hidden.
     refused = alice.upload(b"while removed")
@@ -161,7 +168,8 @@ def test_the_sweep_after_the_date_deletes_every_copy(
     # A copy kept before a migration holds her too.
     folder = settings.data_folder()
     shutil.copyfile(folder / "store.sqlite3", folder / "store.sqlite3.schema-1.bak")
-    assert _rows(settings, "person:alice", str(folder / "store.sqlite3.schema-1.bak")) == 2
+    copy = str(folder / "store.sqlite3.schema-1.bak")
+    assert _rows(settings, "person:alice", copy, (*OBJECTS, "removed")) == 2
 
     clock.advance(30 * DAY - 1)
     report = client.post("/v1/sweep", headers=operator).json()
@@ -176,7 +184,7 @@ def test_the_sweep_after_the_date_deletes_every_copy(
     assert report["files"] == 1
     assert len(blob_files(settings)) == 1
     assert _rows(settings, "person:alice") == 0
-    assert _rows(settings, "person:alice", str(folder / "store.sqlite3.schema-1.bak")) == 0
+    assert _rows(settings, "person:alice", copy, (*OBJECTS, "removed")) == 0
     assert "person:alice" not in _owners(client, operator)
 
     # The root having her again later brings nothing back.
