@@ -1,8 +1,23 @@
-"""The sweep: what has ended is deleted, and removed people's objects with it.
+"""The sweep: what has ended is deleted; removed people are hidden, restored or deleted.
 
 It runs every `sweepIntervalMinutes`, and when the owner asks
-(`POST /v1/sweep`). One sweep at a time: a timed one and an asked one
-wait for each other.
+(`POST /v1/sweep`). One sweep at a time: a timed one, an asked one and a
+Delete now wait for each other.
+
+**Removed people** (call R53-REMOVE, Choice 2: row 7's rules). Each sweep
+asks the root about every person who owns something here, the hidden ones
+included:
+
+- a person it no longer has is hidden at once, with a delete date
+  `removedPeopleDays` from now; with `removedPeopleRetention` "none" their
+  objects are deleted at once instead;
+- a hidden person it has again is restored: the same ids and bytes;
+- a root that cannot be asked hides nobody and restores nobody;
+- a hidden person whose date has passed is deleted for good, every copy,
+  whether or not the root could be asked this time: the date was decided
+  when it answered.
+
+Each deletion is fenced by the generation read before the root was asked.
 """
 
 from __future__ import annotations
@@ -74,60 +89,60 @@ class Sweeper:
 
     async def _removals(self, counts: SweepCounts) -> dict[str, Any]:
         owners = await run_in_threadpool(self.keeper.person_owners)
-        held = set(await run_in_threadpool(self.keeper.held))
-        removal: dict[str, Any] = {"checked": len(owners), "removed": 0, "held": sorted(held)}
-        if not owners:
-            return removal
+        hidden = await run_in_threadpool(self.keeper.removed_people)
+        removal: dict[str, Any] = {"checked": len(owners), "hidden": 0, "restored": 0, "deleted": 0}
         # Read before the root is asked: only what is older than its answer is
         # deleted, so a person restored under the same id keeps what they keep
         # after it (review of row 53).
         fence = await run_in_threadpool(self.keeper.generation)
-        try:
-            known, unknown = await self.people.unknown(owners)
-        except AskFailed as exc:
-            removal["error"] = str(exc)
-            log.warning("removed people were not checked: %s", exc)
-            return removal
-        back = [owner for owner in known if owner in held]
-        if back:
-            await run_in_threadpool(self.keeper.unhold, back)
-            held -= set(back)
-        new = [owner for owner in unknown if owner not in held]
-        brake = self.keeper.config.removal_brake()
-        if brake and len(new) >= brake:
-            await run_in_threadpool(self.keeper.hold, new)
-            held |= set(new)
-            log.warning(
-                "the root no longer knows %d people who own files here; holding them until "
-                "the owner releases them in Settings -> Store (removalBrake %d)",
-                len(new),
-                brake,
-            )
-        elif new:
-            removed = await run_in_threadpool(lambda: self.keeper.remove_owners(new, fence=fence))
-            counts.add(removed)
-            removal["removed"] = len(new)
-            log.info("deleted everything %d removed people kept here", len(new))
-        removal["held"] = sorted(held)
+        if owners:
+            try:
+                known, unknown = await self.people.unknown(owners)
+            except AskFailed as exc:
+                removal["error"] = str(exc)
+                log.warning("removed people were not checked: %s", exc)
+            else:
+                back = [owner for owner in known if owner in hidden]
+                if back:
+                    await run_in_threadpool(self.keeper.restore, back)
+                    for owner in back:
+                        del hidden[owner]
+                    removal["restored"] = len(back)
+                    log.info(
+                        "the root has %d removed people again: their files are back", len(back)
+                    )
+                new = [owner for owner in unknown if owner not in hidden]
+                if new and self.keeper.config.removed_at_once():
+                    counts.add(
+                        await run_in_threadpool(lambda: self.keeper.remove_owners(new, fence=fence))
+                    )
+                    removal["deleted"] += len(new)
+                    log.info("deleted everything %d removed people kept here", len(new))
+                elif new:
+                    seconds = self.keeper.config.removed_seconds()
+                    done = await run_in_threadpool(self.keeper.hide, new, seconds)
+                    removal["hidden"] = len(done)
+                    log.info(
+                        "the root no longer has %d people: their files are hidden, and deleted "
+                        "in %d days",
+                        len(done),
+                        seconds // 86400,
+                    )
+        now = self.keeper.now()
+        due = sorted(owner for owner, dates in hidden.items() if dates["deleteAt"] <= now)
+        if due:
+            counts.add(await run_in_threadpool(lambda: self.keeper.remove_owners(due, fence=fence)))
+            removal["deleted"] += len(due)
+            log.info("deleted everything %d removed people kept here: their date passed", len(due))
         return removal
 
-    async def release(self) -> dict[str, Any]:
-        """Delete what the held people own, after asking the root once more."""
+    async def delete_now(self, owner: str) -> dict[str, Any]:
+        """The owner's Delete now: a removed person's objects, at once and for good."""
         async with self._lock:
             started = time.time()
-            held = await run_in_threadpool(self.keeper.held)
-            removal: dict[str, Any] = {"checked": len(held), "removed": 0, "held": []}
-            counts = SweepCounts()
-            if held:
-                fence = await run_in_threadpool(self.keeper.generation)
-                known, unknown = await self.people.unknown(held)
-                if known:
-                    await run_in_threadpool(self.keeper.unhold, known)
-                if unknown:
-                    counts = await run_in_threadpool(
-                        lambda: self.keeper.remove_owners(unknown, fence=fence)
-                    )
-                    removal["removed"] = len(unknown)
+            counts = await run_in_threadpool(self.keeper.delete_now, owner)
+            removal = {"checked": 0, "hidden": 0, "restored": 0, "deleted": 1}
             report = report_of(counts, at=started, removal=removal)
             await run_in_threadpool(self.keeper.save_report, report)
+            log.info("the owner deleted everything a removed person kept here")
             return report

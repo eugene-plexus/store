@@ -1938,6 +1938,25 @@ class StoreOwner(BaseModel):
         description="The bytes of the owner's files and of its uploads in progress.",
     )
     uploads: int = Field(..., description='Uploads in progress.')
+    removedAt: int | None = Field(
+        None,
+        description='Unix seconds. Set for a person Eugene removed: their objects\nhave been hidden from everyone since then.\n',
+    )
+    deleteAt: int | None = Field(
+        None,
+        description='Unix seconds. Set with `removedAt`: when their objects are\ndeleted for good, unless Eugene has them again first or the\nowner deletes them now.\n',
+    )
+
+
+class RemovalDeleteRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    owner: str = Field(
+        ...,
+        description='The removed person, as `/v1/owners` names them.',
+        pattern='^person:[A-Za-z0-9._@:-]{1,200}$',
+    )
 
 
 class StoreOwnerList(BaseModel):
@@ -1961,17 +1980,20 @@ class RemovalCheck(BaseModel):
         ...,
         description='How many people who own something here the root was asked about.',
     )
-    removed: int = Field(
-        ...,
-        description='How many of them the root no longer knows and whose objects were deleted.',
+    hidden: int = Field(
+        ..., description='People the root no longer has, whose objects were hidden now.'
     )
-    held: list[str] = Field(
+    restored: int = Field(
         ...,
-        description='`person:<id>` owners the root no longer knows, held because\n`removalBrake` or more were unknown at once. Nothing of theirs\nis deleted until the owner releases them.\n',
+        description='Hidden people the root has again, whose objects are theirs again.',
+    )
+    deleted: int = Field(
+        ...,
+        description='Removed people whose objects were deleted for good: their date\npassed, `removedPeopleRetention` is `none`, or Delete now.\n',
     )
     error: str | None = Field(
         None,
-        description='Why the root could not be asked; then nothing was deleted for removal.',
+        description='Why the root could not be asked; then nobody was hidden or\nrestored. A date that had passed was still kept to.\n',
     )
 
 
@@ -2002,10 +2024,6 @@ class StoreStatus(BaseModel):
     )
     parts: StoreParts
     lastSweep: SweepReport | None = None
-    held: list[str] = Field(
-        ...,
-        description='Removed people whose objects wait for the owner (`POST /v1/removals/release`).',
-    )
 
 
 class InputAudio(BaseModel):

@@ -18,14 +18,16 @@ Design: [`docs/design/rows/row-53.md`](https://github.com/eugene-plexus/specs/bl
 - **Only the owner sees it.** Another owner's id answers exactly as a missing
   one. The install owner sees counts and bytes per owner, never names or
   content.
-- **Every object ends.** A file lives 30 days by default, or what its app asked,
-  up to the install's maximum. An upload in progress lives one hour. The sweep
-  deletes what ended: its row (SQLite's `secure_delete` is on) and its blob
-  when no other file shares it.
-- **A removed person's objects go.** Each sweep asks the root, through this
-  machine's agent, which people it still has; everything a removed person kept
-  is deleted. When several are removed at once they are held until the owner
-  releases them in Settings -> Store.
+- **A file is kept until it is deleted**, as OpenAI keeps one, unless its app
+  asked for an end (one hour to 30 days) or the owner set a default life. An
+  upload in progress lives one hour. The sweep deletes what ended: its row
+  (SQLite's `secure_delete` is on) and its blob when no other file shares it.
+- **A removed person's objects are hidden, then deleted**, as Workbench does
+  (row 7). Each sweep asks the root, through this machine's agent, which
+  people it still has. A person it no longer has is hidden at once and deleted
+  30 days later (`removedPeopleDays`), or at once when the owner keeps a
+  removed person's data "Not at all"; the root having them again first brings
+  everything back. The owner's Delete now deletes at once, every copy.
 
 ## Where it keeps things
 

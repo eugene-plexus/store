@@ -6,10 +6,10 @@ It sends the ids of the people who own something here to its agent's
 token. A store's own token cannot reach the root: a node may send only an
 agent's or a granted gateway's token off its machine.
 
-**Nothing is deleted on a guess.** A root that cannot be asked, or does
-not answer as it should, deletes nothing. When `removalBrake` people or
-more are unknown at once (a restored root, a different root), they are
-held until the owner releases them in Settings -> Store.
+**Nothing is hidden or deleted on a guess.** A root that cannot be
+asked, or does not answer as it should, changes nothing; a person it
+names in neither list is a failed answer. What an answer does is the
+sweep's (`sweeper.py`): hide, restore, delete on the date.
 """
 
 from __future__ import annotations

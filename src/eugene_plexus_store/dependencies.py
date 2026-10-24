@@ -101,7 +101,7 @@ def require_operator(
     request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> tokens.Claims | None:
-    """An operator session only: settings, counts, the sweep, held removals."""
+    """An operator session only: settings, counts, the sweep, Delete now."""
     return _claims(request, creds, (tokens.TYP_SESSION,))
 
 

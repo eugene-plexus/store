@@ -85,9 +85,10 @@ def _schema_1(connection: sqlite3.Connection) -> None:
             created_at INTEGER NOT NULL
         );
         CREATE INDEX parts_by_upload ON parts(upload_id);
-        CREATE TABLE held (
+        CREATE TABLE removed (
             owner TEXT PRIMARY KEY,
-            found_at INTEGER NOT NULL
+            found_at INTEGER NOT NULL,
+            delete_at INTEGER NOT NULL
         );
         CREATE TABLE sweeps (
             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -102,7 +103,7 @@ MIGRATIONS: Sequence[Callable[[sqlite3.Connection], None]] = (_schema_1,)
 
 #: The tables that hold an owner's rows, for removal: from the database
 #: and from every `.bak` copy.
-OWNER_TABLES = ("files", "uploads", "parts", "held")
+OWNER_TABLES = ("files", "uploads", "parts", "removed")
 
 
 def _connect(path: Path) -> sqlite3.Connection:

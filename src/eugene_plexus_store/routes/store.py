@@ -1,16 +1,16 @@
-"""The owner's console: counts per owner (never content), the sweep, held removals."""
+"""The owner's console: counts per owner (never content), the sweep, Delete now."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, Request
 from starlette.concurrency import run_in_threadpool
 
+from .._generated.models import RemovalDeleteRequest
 from ..config import ConfigStore
 from ..dependencies import require_operator, require_reader
-from ..problems import problem
-from ..removal import AskFailed
+from ..problems import StoreProblem, problem
 from ..sweeper import Sweeper
 from .files import _keeper
 
@@ -35,8 +35,7 @@ async def store_status(request: Request) -> Any:
     keeper = _keeper(request)
     config: ConfigStore = request.app.state.config_store
     report = await run_in_threadpool(keeper.last_report)
-    held = await run_in_threadpool(keeper.held)
-    answer: dict[str, Any] = {"parts": {"files": config.files_enabled()}, "held": held}
+    answer: dict[str, Any] = {"parts": {"files": config.files_enabled()}}
     if report is not None:
         answer["lastSweep"] = report
     return answer
@@ -47,13 +46,10 @@ async def sweep_now(request: Request) -> Any:
     return await _sweeper(request).sweep()
 
 
-@router.post("/v1/removals/release", dependencies=[Depends(require_operator)])
-async def release(request: Request) -> Any:
+@router.post("/v1/removals/delete", dependencies=[Depends(require_operator)])
+async def delete_now(body: RemovalDeleteRequest, request: Request) -> Any:
+    """Delete now: a removed person's objects, at once and for good (MRC27)."""
     try:
-        return await _sweeper(request).release()
-    except AskFailed as exc:
-        raise problem(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Root not asked",
-            f"Nothing was deleted: {exc}",
-        ) from exc
+        return await _sweeper(request).delete_now(body.owner)
+    except StoreProblem as exc:
+        raise exc.http() from exc

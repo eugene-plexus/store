@@ -20,6 +20,7 @@ from ._generated.models import (
     ConfigDocument,
     ConfigField,
     ConfigFieldError,
+    ConfigFieldShowWhen,
     ConfigSchema,
     ConfigUpdateRequest,
     ConfigUpdateResult,
@@ -30,6 +31,13 @@ log = logging.getLogger(__name__)
 
 GIB = 1024 * 1024 * 1024
 DAY = 24 * 3600
+
+#: Row 7's legal-hold setting, with its keys, values and words (R53-REMOVE).
+REMOVED_PEOPLE_RETENTION = "removedPeopleRetention"
+RETENTION_DAYS, RETENTION_NONE = "days", "none"
+RETENTION_CHOICES = (RETENTION_DAYS, RETENTION_NONE)
+REMOVED_PEOPLE_DAYS = "removedPeopleDays"
+MIN_REMOVED_DAYS, MAX_REMOVED_DAYS = 1, 365
 
 CATEGORY_LABELS: dict[str, str] = {
     "files": "Files",
@@ -104,18 +112,39 @@ FIELDS: list[ConfigField] = [
         maximum=1440,
     ),
     ConfigField(
-        key="removalBrake",
-        label="Hold when this many are removed at once",
+        key=REMOVED_PEOPLE_RETENTION,
+        label="Keep a removed person's data",
         description=(
-            "When the root no longer knows this many people or more at one check, nothing "
-            "of theirs is deleted until you release them here. It guards against a "
-            "restored or wrong root emptying the store. 0 never holds."
+            "Whether a person removed from Eugene has their files kept, hidden, for some "
+            "days, or deleted at once.\n\n"
+            "Kept, their files and uploads are hidden from everyone, the owner included; "
+            "the owner can delete them now from Settings -> Files apps keep. If Eugene has "
+            "the person again before the date, everything comes back as it was. **Not at "
+            "all** deletes them the moment the store finds out, with every copy the store "
+            "keeps. A change applies to people removed after it: people already removed "
+            "keep their dates."
+        ),
+        category="people",
+        valueType=ConfigValueType.enum,
+        enumValues=list(RETENTION_CHOICES),
+        enumLabels=["For a number of days", "Not at all"],
+        default=RETENTION_DAYS,
+    ),
+    ConfigField(
+        key=REMOVED_PEOPLE_DAYS,
+        label="Days before a removed person's data is deleted",
+        description=(
+            "How long the store hides the files of a person removed from Eugene before it "
+            "deletes them.\n\n"
+            "Deleting removes every copy the store keeps. A change applies to people removed "
+            "after it: people already removed keep their dates."
         ),
         category="people",
         valueType=ConfigValueType.integer,
-        default=3,
-        minimum=0,
-        maximum=1000,
+        default=30,
+        minimum=MIN_REMOVED_DAYS,
+        maximum=MAX_REMOVED_DAYS,
+        showWhen=ConfigFieldShowWhen(key=REMOVED_PEOPLE_RETENTION, equals=RETENTION_DAYS),
     ),
     ConfigField(
         key="logLevel",
@@ -270,8 +299,13 @@ class ConfigStore:
     def sweep_seconds(self) -> float:
         return float(self.get("sweepIntervalMinutes")) * 60.0
 
-    def removal_brake(self) -> int:
-        return int(self.get("removalBrake"))
+    def removed_at_once(self) -> bool:
+        """A removed person's objects are deleted when the store finds out."""
+        return self.get(REMOVED_PEOPLE_RETENTION) == RETENTION_NONE
+
+    def removed_seconds(self) -> int:
+        """How long a removed person's objects stay hidden before they are deleted."""
+        return int(self.get(REMOVED_PEOPLE_DAYS)) * DAY
 
     def _write_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

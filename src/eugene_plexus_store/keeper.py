@@ -23,7 +23,15 @@ join another's parts.
 * A file that has ended counts until its bytes are deleted. An owner at
   its quota has its own ended files deleted first, then is asked again.
 
-**Removal is fenced by generation.** Every file and upload carries the
+**A removed person is hidden, then deleted** (call R53-REMOVE, Choice 2:
+row 7's rules). An owner in `removed` is answered as if it kept nothing:
+every lookup and listing leaves its objects out, the same 404 as an id
+that does not exist, and nothing new is kept for it. Its objects stay on
+disk, counted against it, until its date (`delete_at`, fixed when it was
+hidden) or the owner's Delete now; a person the root has again before
+that is restored with the same ids and bytes.
+
+**Deletion is fenced by generation.** Every file and upload carries the
 store's generation counter at its making. The sweep reads the counter
 before it asks the root who was removed, and deletes only what is older:
 a person restored under the same id who keeps something new in between
@@ -70,6 +78,8 @@ DEFAULT_MIME = "application/octet-stream"
 ENDED = "expires_at IS NOT NULL AND expires_at <= ?"
 #: An object that has not ended.
 LIVE = "(expires_at IS NULL OR expires_at > ?)"
+#: An object whose owner was not removed (a hidden owner keeps nothing visible).
+SHOWN = "owner NOT IN (SELECT owner FROM removed)"
 
 
 def _new_id(prefix: str) -> str:
@@ -265,8 +275,16 @@ class Keeper:
 
     def _check_quota(self, owner: str, adding: int) -> None:
         """Room for one more object of `adding` bytes, or the 413 with the numbers.
-        An owner at its quota has its own ended objects deleted first. Called
-        under the lock, outside any transaction."""
+        An owner at its quota has its own ended objects deleted first. A removed
+        person keeps nothing new, so no new object reclaims their hidden ones.
+        Called under the lock, outside any transaction."""
+        if self._is_removed(owner):
+            raise StoreProblem(
+                403,
+                "Removed",
+                "Eugene removed this person: what they kept here is hidden, and nothing new "
+                "is kept for them unless Eugene has them again.",
+            )
         problem = self._over(owner, adding)
         if problem is None:
             return
@@ -381,7 +399,7 @@ class Keeper:
         self.check_owner(owner)
         if FILE_ID.match(file_id):
             row = self.database.connection.execute(
-                f"SELECT * FROM files WHERE id = ? AND owner = ? AND {LIVE}",
+                f"SELECT * FROM files WHERE id = ? AND owner = ? AND {LIVE} AND {SHOWN}",
                 (file_id, owner, self.now()),
             ).fetchone()
             if row is not None:
@@ -429,7 +447,7 @@ class Keeper:
             raise StoreProblem(400, "Bad order", "order: asc or desc.")
         limit = max(1, min(int(limit), 10000))
         descending = order == "desc"
-        clauses = ["owner = ?", LIVE]
+        clauses = ["owner = ?", LIVE, SHOWN]
         values: list[Any] = [owner, self.now()]
         if purpose is not None:
             clauses.append("purpose = ?")
@@ -466,7 +484,8 @@ class Keeper:
         self.check_owner(owner)
         if UPLOAD_ID.match(upload_id):
             row = self.database.connection.execute(
-                "SELECT * FROM uploads WHERE id = ? AND owner = ?", (upload_id, owner)
+                f"SELECT * FROM uploads WHERE id = ? AND owner = ? AND {SHOWN}",
+                (upload_id, owner),
             ).fetchone()
             if row is not None:
                 if pending and row["status"] != "pending":
@@ -818,39 +837,68 @@ class Keeper:
             counts.add(self._delete_where("owner = ? AND generation <= ?", (owner, fence)))
         with self.database.transaction() as connection:
             connection.executemany(
-                "DELETE FROM held WHERE owner = ?", [(owner,) for owner in owners]
+                "DELETE FROM removed WHERE owner = ?", [(owner,) for owner in owners]
             )
         self.database.purge_backups(owners)
         return counts
 
+    def delete_now(self, owner: str) -> SweepCounts:
+        """The owner's Delete now for a removed person: everything they kept, at
+        once and for good, every copy (MRC27). Only a removed person: a person
+        Eugene still has keeps their files."""
+        self.check_owner(owner)
+        with self.database.lock:
+            if not self._is_removed(owner):
+                raise StoreProblem(404, "Not removed", f"{owner} is not a person Eugene removed.")
+            return self.remove_owners([owner], fence=self.generation())
+
     # -- people and the console ----------------------------------------------
 
     def person_owners(self) -> list[str]:
+        """Every person who owns something here, the hidden ones included."""
         with self.database.lock:
             rows = self.database.connection.execute(
                 "SELECT owner FROM files WHERE owner LIKE 'person:%' "
-                "UNION SELECT owner FROM uploads WHERE owner LIKE 'person:%' ORDER BY 1"
+                "UNION SELECT owner FROM uploads WHERE owner LIKE 'person:%' "
+                "UNION SELECT owner FROM removed ORDER BY 1"
             ).fetchall()
         return [row[0] for row in rows]
 
-    def held(self) -> list[str]:
+    def _is_removed(self, owner: str) -> bool:
+        found = self.database.connection.execute(
+            "SELECT 1 FROM removed WHERE owner = ?", (owner,)
+        ).fetchone()
+        return found is not None
+
+    def removed_people(self) -> dict[str, dict[str, int]]:
+        """Each hidden owner: when it was found removed, and its delete date."""
         with self.database.lock:
-            return [
-                row[0]
-                for row in self.database.connection.execute("SELECT owner FROM held ORDER BY owner")
-            ]
+            return {
+                row["owner"]: {"removedAt": row["found_at"], "deleteAt": row["delete_at"]}
+                for row in self.database.connection.execute("SELECT * FROM removed")
+            }
 
-    def hold(self, owners: list[str]) -> None:
+    def hide(self, owners: list[str], seconds: int) -> list[str]:
+        """Hide these removed people now. Each one's date is fixed here, from the
+        setting now: a later change never shortens it."""
+        now = self.now()
+        hidden = []
+        with self.database.transaction() as connection:
+            for owner in owners:
+                self.check_owner(owner)
+                cursor = connection.execute(
+                    "INSERT OR IGNORE INTO removed (owner, found_at, delete_at) VALUES (?, ?, ?)",
+                    (owner, now, now + seconds),
+                )
+                if cursor.rowcount:
+                    hidden.append(owner)
+        return hidden
+
+    def restore(self, owners: list[str]) -> None:
+        """The root has these people again: everything they kept is theirs again."""
         with self.database.transaction() as connection:
             connection.executemany(
-                "INSERT OR IGNORE INTO held (owner, found_at) VALUES (?, ?)",
-                [(owner, self.now()) for owner in owners],
-            )
-
-    def unhold(self, owners: list[str]) -> None:
-        with self.database.transaction() as connection:
-            connection.executemany(
-                "DELETE FROM held WHERE owner = ?", [(owner,) for owner in owners]
+                "DELETE FROM removed WHERE owner = ?", [(owner,) for owner in owners]
             )
 
     def owners(self) -> dict[str, Any]:
@@ -874,6 +922,10 @@ class Keeper:
                 "SELECT COALESCE(SUM(bytes), 0) FROM "
                 "(SELECT sha256, MAX(bytes) AS bytes FROM files GROUP BY sha256)"
             ).fetchone()[0]
+            for row in connection.execute("SELECT * FROM removed"):
+                if row["owner"] in found:
+                    found[row["owner"]]["removedAt"] = row["found_at"]
+                    found[row["owner"]]["deleteAt"] = row["delete_at"]
         owners = sorted(found.values(), key=lambda entry: (-entry["bytes"], entry["owner"]))
         return {
             "owners": owners,
