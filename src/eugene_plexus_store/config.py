@@ -301,7 +301,7 @@ class ConfigStore:
 
     def removed_at_once(self) -> bool:
         """A removed person's objects are deleted when the store finds out."""
-        return self.get(REMOVED_PEOPLE_RETENTION) == RETENTION_NONE
+        return bool(self.get(REMOVED_PEOPLE_RETENTION) == RETENTION_NONE)
 
     def removed_seconds(self) -> int:
         """How long a removed person's objects stay hidden before they are deleted."""
