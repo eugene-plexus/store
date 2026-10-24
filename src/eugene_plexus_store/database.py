@@ -26,6 +26,17 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 FILENAME = "store.sqlite3"
+#: How long a purge waits on a copy another process holds locked, in seconds.
+BACKUP_TIMEOUT = 5.0
+
+
+class BackupPurgeFailed(Exception):
+    """A copy kept before a migration could not be purged of a person's rows.
+    `failures` names each file and why."""
+
+    def __init__(self, failures: list[tuple[Path, str]]) -> None:
+        self.failures = failures
+        super().__init__("; ".join(f"{path.name}: {why}" for path, why in failures))
 
 
 def _run(connection: sqlite3.Connection, script: str) -> None:
@@ -88,7 +99,8 @@ def _schema_1(connection: sqlite3.Connection) -> None:
         CREATE TABLE removed (
             owner TEXT PRIMARY KEY,
             found_at INTEGER NOT NULL,
-            delete_at INTEGER NOT NULL
+            delete_at INTEGER NOT NULL,
+            marker INTEGER NOT NULL
         );
         CREATE TABLE sweeps (
             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -106,8 +118,10 @@ MIGRATIONS: Sequence[Callable[[sqlite3.Connection], None]] = (_schema_1,)
 OWNER_TABLES = ("files", "uploads", "parts", "removed")
 
 
-def _connect(path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+def _connect(path: Path, timeout: float = 5.0) -> sqlite3.Connection:
+    connection = sqlite3.connect(
+        path, check_same_thread=False, isolation_level=None, timeout=timeout
+    )
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA secure_delete = ON")
     connection.execute("PRAGMA foreign_keys = ON")
@@ -170,26 +184,36 @@ class Database:
         return sorted(self.folder.glob(f"{FILENAME}.schema-*.bak"))
 
     def purge_backups(self, owners: Sequence[str]) -> None:
-        """Remove `owners` from every copy kept before a migration."""
+        """Remove `owners` from every copy kept before a migration. Every copy is
+        tried; one that cannot be purged is named in `BackupPurgeFailed`, raised
+        after the rest, so the caller keeps its retry record."""
+        failures: list[tuple[Path, str]] = []
         for backup in self.backups():
-            connection = _connect(backup)
             try:
-                tables = {
-                    row[0]
-                    for row in connection.execute(
-                        "SELECT name FROM sqlite_master WHERE type = 'table'"
-                    )
-                }
-                with _transaction(connection):
-                    for table in OWNER_TABLES:
-                        if table in tables:
-                            connection.executemany(
-                                f"DELETE FROM {table} WHERE owner = ?",
-                                [(owner,) for owner in owners],
-                            )
-                connection.execute("VACUUM")
-            finally:
-                connection.close()
+                self._purge_one(backup, owners)
+            except (sqlite3.Error, OSError) as exc:
+                failures.append((backup, str(exc) or type(exc).__name__))
+        if failures:
+            raise BackupPurgeFailed(failures)
+
+    @staticmethod
+    def _purge_one(backup: Path, owners: Sequence[str]) -> None:
+        connection = _connect(backup, BACKUP_TIMEOUT)
+        try:
+            tables = {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+            with _transaction(connection):
+                for table in OWNER_TABLES:
+                    if table in tables:
+                        connection.executemany(
+                            f"DELETE FROM {table} WHERE owner = ?",
+                            [(owner,) for owner in owners],
+                        )
+            connection.execute("VACUUM")
+        finally:
+            connection.close()
 
 
 @contextlib.contextmanager

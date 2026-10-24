@@ -11,11 +11,15 @@ included:
 - a person it no longer has is hidden at once, with a delete date
   `removedPeopleDays` from now; with `removedPeopleRetention` "none" their
   objects are deleted at once instead;
-- a hidden person it has again is restored: the same ids and bytes;
+- a hidden person it has again is restored: the same ids and bytes, but only
+  before their date: a date that has passed is final;
 - a root that cannot be asked hides nobody and restores nobody;
 - a hidden person whose date has passed is deleted for good, every copy,
   whether or not the root could be asked this time: the date was decided
-  when it answered.
+  when it answered. The markers are read again after the answer, and a
+  deletion is compare-and-delete on the marker seen, so an answer that is
+  stale by the time it is used cannot delete a person restored meanwhile;
+- a copy that cannot be purged keeps the marker, and the sweep names it.
 
 Each deletion is fenced by the generation read before the root was asked.
 """
@@ -24,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import time
 from typing import Any
@@ -31,6 +36,7 @@ from typing import Any
 from starlette.concurrency import run_in_threadpool
 
 from .keeper import Keeper, SweepCounts, report_of
+from .problems import StoreProblem
 from .removal import AskFailed, PeopleCheck
 
 log = logging.getLogger(__name__)
@@ -88,52 +94,81 @@ class Sweeper:
             return report
 
     async def _removals(self, counts: SweepCounts) -> dict[str, Any]:
-        owners = await run_in_threadpool(self.keeper.person_owners)
-        hidden = await run_in_threadpool(self.keeper.removed_people)
-        removal: dict[str, Any] = {"checked": len(owners), "hidden": 0, "restored": 0, "deleted": 0}
+        keeper = self.keeper
+        owners = await run_in_threadpool(keeper.person_owners)
+        removal: dict[str, Any] = {
+            "checked": len(owners),
+            "hidden": 0,
+            "restored": 0,
+            "deleted": 0,
+            "lateRestored": 0,
+        }
+        errors: list[str] = []
         # Read before the root is asked: only what is older than its answer is
-        # deleted, so a person restored under the same id keeps what they keep
-        # after it (review of row 53).
-        fence = await run_in_threadpool(self.keeper.generation)
+        # deleted (review of row 53).
+        fence = await run_in_threadpool(keeper.generation)
+        before = await run_in_threadpool(keeper.removed_people)
         if owners:
             try:
                 known, unknown = await self.people.unknown(owners)
             except AskFailed as exc:
-                removal["error"] = str(exc)
+                errors.append(str(exc))
                 log.warning("removed people were not checked: %s", exc)
             else:
-                back = [owner for owner in known if owner in hidden]
+                # What is hidden is read again now: the answer may be stale by the time
+                # it is used, and a person restored meanwhile must not be acted on.
+                fresh = await run_in_threadpool(keeper.removed_people)
+                back = await run_in_threadpool(keeper.restore, [o for o in known if o in fresh])
+                removal["restored"] = len(back)
+                removal["lateRestored"] = len([o for o in known if o in fresh]) - len(back)
                 if back:
-                    await run_in_threadpool(self.keeper.restore, back)
-                    for owner in back:
-                        del hidden[owner]
-                    removal["restored"] = len(back)
                     log.info(
                         "the root has %d removed people again: their files are back", len(back)
                     )
-                new = [owner for owner in unknown if owner not in hidden]
-                if new and self.keeper.config.removed_at_once():
-                    counts.add(
-                        await run_in_threadpool(lambda: self.keeper.remove_owners(new, fence=fence))
-                    )
-                    removal["deleted"] += len(new)
-                    log.info("deleted everything %d removed people kept here", len(new))
-                elif new:
-                    seconds = self.keeper.config.removed_seconds()
-                    done = await run_in_threadpool(self.keeper.hide, new, seconds)
-                    removal["hidden"] = len(done)
+                if removal["lateRestored"]:
                     log.info(
-                        "the root no longer has %d people: their files are hidden, and deleted "
-                        "in %d days",
-                        len(done),
-                        seconds // 86400,
+                        "the root has %d removed people again, but their date had passed: "
+                        "their files are deleted",
+                        removal["lateRestored"],
                     )
-        now = self.keeper.now()
-        due = sorted(owner for owner, dates in hidden.items() if dates["deleteAt"] <= now)
-        if due:
-            counts.add(await run_in_threadpool(lambda: self.keeper.remove_owners(due, fence=fence)))
-            removal["deleted"] += len(due)
-            log.info("deleted everything %d removed people kept here: their date passed", len(due))
+                # A person already hidden when the question was asked is not hidden again
+                # by that answer: it may be the one that was restored since.
+                new = [o for o in unknown if o not in before and o not in fresh]
+                if new:
+                    at_once = keeper.config.removed_at_once()
+                    seconds = 0 if at_once else keeper.config.removed_seconds()
+                    done = await run_in_threadpool(keeper.hide, new, seconds)
+                    if not at_once:
+                        removal["hidden"] = len(done)
+                        log.info(
+                            "the root no longer has %d people: their files are hidden, and "
+                            "deleted in %d days",
+                            len(done),
+                            seconds // 86400,
+                        )
+        # Whoever's date has passed is deleted, read fresh and compare-and-delete on the
+        # marker seen: a marker restored or replaced since is left alone.
+        now = keeper.now()
+        due = await run_in_threadpool(keeper.removed_people)
+        for owner, dates in sorted(due.items()):
+            if dates["deleteAt"] > now:
+                continue
+            try:
+                result = await run_in_threadpool(
+                    functools.partial(
+                        keeper.delete_removed, owner, marker=dates["marker"], fence=fence
+                    )
+                )
+            except StoreProblem as exc:
+                errors.append(exc.detail)
+                log.warning("could not finish deleting %s: %s", owner, exc.detail)
+                continue
+            if result is not None:
+                counts.add(result)
+                removal["deleted"] += 1
+                log.info("deleted everything a removed person kept here")
+        if errors:
+            removal["error"] = " ".join(errors)
         return removal
 
     async def delete_now(self, owner: str) -> dict[str, Any]:
@@ -141,7 +176,7 @@ class Sweeper:
         async with self._lock:
             started = time.time()
             counts = await run_in_threadpool(self.keeper.delete_now, owner)
-            removal = {"checked": 0, "hidden": 0, "restored": 0, "deleted": 1}
+            removal = {"checked": 0, "hidden": 0, "restored": 0, "deleted": 1, "lateRestored": 0}
             report = report_of(counts, at=started, removal=removal)
             await run_in_threadpool(self.keeper.save_report, report)
             log.info("the owner deleted everything a removed person kept here")

@@ -64,7 +64,13 @@ def test_a_removed_persons_objects_are_hidden_from_everyone_at_once(
 
     agent.removed = {"alice"}
     report = client.post("/v1/sweep", headers=operator).json()
-    assert _removal(report) == {"checked": 2, "hidden": 1, "restored": 0, "deleted": 0}
+    assert _removal(report) == {
+        "checked": 2,
+        "hidden": 1,
+        "restored": 0,
+        "deleted": 0,
+        "lateRestored": 0,
+    }
     assert agent.asked == [["alice", "bob"]]
 
     # The former owner, as the gateway would name her, finds nothing.
@@ -122,7 +128,13 @@ def test_a_person_restored_within_the_days_gets_the_same_files_back(
     clock.advance(29 * DAY)
     agent.removed = set()
     report = client.post("/v1/sweep", headers=operator).json()
-    assert _removal(report) == {"checked": 1, "hidden": 0, "restored": 1, "deleted": 0}
+    assert _removal(report) == {
+        "checked": 1,
+        "hidden": 0,
+        "restored": 1,
+        "deleted": 0,
+        "lateRestored": 0,
+    }
     assert alice.get(f"/v1/files/{first['id']}").json() == first
     assert alice.get(f"/v1/files/{second['id']}/content").content == b"the second"
     assert {f["id"] for f in alice.get("/v1/files").json()["data"]} == {first["id"], second["id"]}
@@ -222,7 +234,13 @@ def test_not_at_all_deletes_a_removed_person_when_the_store_finds_out(
     as_owner("person:bob").upload(b"bob only")
     agent.removed = {"alice"}
     report = client.post("/v1/sweep", headers=operator).json()
-    assert _removal(report) == {"checked": 2, "hidden": 0, "restored": 0, "deleted": 1}
+    assert _removal(report) == {
+        "checked": 2,
+        "hidden": 0,
+        "restored": 0,
+        "deleted": 1,
+        "lateRestored": 0,
+    }
     assert len(blob_files(settings)) == 1
     agent.removed = set()
     client.post("/v1/sweep", headers=operator)

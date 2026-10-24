@@ -31,6 +31,18 @@ disk, counted against it, until its date (`delete_at`, fixed when it was
 hidden) or the owner's Delete now; a person the root has again before
 that is restored with the same ids and bytes.
 
+**Nothing already under way comes back** (second review). Every write
+counts as busy for its owner from the moment its room is taken until it has
+ended or been refused. Every commit (a whole file, an assembled upload, a
+part) re-checks the owner's removal state in its own transaction and refuses
+for a hidden owner, so a write paused across the removal publishes nothing.
+Deleting a removed person waits for their busy writes, then deletes; the
+marker is the retry record and is removed last, only once every row, blob and
+`.bak` copy is gone. A marker whose date has passed is final: a restoration
+after it changes nothing. Deletion is compare-and-delete on the marker's own
+generation, so an answer that is stale by the time it is used cannot delete a
+person restored meanwhile.
+
 **Deletion is fenced by generation.** Every file and upload carries the
 store's generation counter at its making. The sweep reads the counter
 before it asks the root who was removed, and deletes only what is older:
@@ -56,7 +68,7 @@ from typing import Any
 
 from .blobs import Blobs, Written
 from .config import GIB, ConfigStore
-from .database import Database
+from .database import BackupPurgeFailed, Database
 from .problems import StoreProblem, not_found
 
 log = logging.getLogger(__name__)
@@ -84,6 +96,15 @@ SHOWN = "owner NOT IN (SELECT owner FROM removed)"
 
 def _new_id(prefix: str) -> str:
     return prefix + secrets.token_hex(12)
+
+
+def _removed() -> StoreProblem:
+    return StoreProblem(
+        403,
+        "Removed",
+        "Eugene removed this person: what they kept here is hidden, and nothing new "
+        "is kept for them unless Eugene has them again.",
+    )
 
 
 def _human(size: int) -> str:
@@ -124,8 +145,13 @@ class Keeper:
         self._reserved_bytes: dict[str, int] = {}
         self._reserved_files: dict[str, int] = {}
         self._part_bytes: dict[str, int] = {}
+        self._part_owner: dict[str, str] = {}
         self._assembling: set[str] = set()
-        self._guard = threading.Lock()
+        # Writes under way, by owner; a removal waits for its owner's to end.
+        self._busy: dict[str, int] = {}
+        self._guard = threading.Condition(threading.Lock())
+        #: How long a deletion waits for the owner's writes to end, in seconds.
+        self.idle_wait_seconds = 120.0
 
     def open(self) -> None:
         self.blobs.prepare()
@@ -247,6 +273,20 @@ class Keeper:
         with self._guard:
             flying_files = self._reserved_files.get(owner, 0)
             flying_bytes = self._reserved_bytes.get(owner, 0)
+            staging = [
+                (upload_id, size)
+                for upload_id, size in self._part_bytes.items()
+                if self._part_owner.get(upload_id) == owner
+            ]
+        # A part still being written counts until its bytes are gone, even when its
+        # upload was cancelled or ended meanwhile: only a pending upload's declared
+        # size already covers it.
+        for upload_id, size in staging:
+            row = connection.execute(
+                "SELECT status FROM uploads WHERE id = ?", (upload_id,)
+            ).fetchone()
+            if row is None or row["status"] != "pending":
+                flying_bytes += size
         return (
             int(files[0]) + int(pending[0]) + flying_files,
             int(files[1]) + int(pending[1]) + flying_bytes,
@@ -279,12 +319,7 @@ class Keeper:
         person keeps nothing new, so no new object reclaims their hidden ones.
         Called under the lock, outside any transaction."""
         if self._is_removed(owner):
-            raise StoreProblem(
-                403,
-                "Removed",
-                "Eugene removed this person: what they kept here is hidden, and nothing new "
-                "is kept for them unless Eugene has them again.",
-            )
+            raise _removed()
         problem = self._over(owner, adding)
         if problem is None:
             return
@@ -294,14 +329,38 @@ class Keeper:
         if problem is not None:
             raise problem
 
+    def _enter(self, owner: str) -> None:
+        """A write of `owner` begins. Called with `_guard` held."""
+        self._busy[owner] = self._busy.get(owner, 0) + 1
+
+    def _leave(self, owner: str) -> None:
+        """A write of `owner` ended or was refused; wakes a deletion waiting for it."""
+        with self._guard:
+            self._busy[owner] -= 1
+            if not self._busy[owner]:
+                del self._busy[owner]
+            self._guard.notify_all()
+
+    def _wait_idle(self, owner: str) -> bool:
+        deadline = time.perf_counter() + self.idle_wait_seconds
+        with self._guard:
+            while self._busy.get(owner):
+                left = deadline - time.perf_counter()
+                if left <= 0:
+                    return False
+                self._guard.wait(left)
+        return True
+
     @contextlib.contextmanager
     def _reservation(self, owner: str, size: int) -> Iterator[None]:
-        """Hold room for one file of `size` bytes while it is written."""
+        """Hold room for one file of `size` bytes while it is written. The write is
+        busy for its owner until it ends."""
         with self.database.lock:
             self._check_quota(owner, size)
             with self._guard:
                 self._reserved_bytes[owner] = self._reserved_bytes.get(owner, 0) + size
                 self._reserved_files[owner] = self._reserved_files.get(owner, 0) + 1
+                self._enter(owner)
         try:
             yield
         finally:
@@ -311,6 +370,7 @@ class Keeper:
                 if not self._reserved_files[owner]:
                     del self._reserved_files[owner]
                     del self._reserved_bytes[owner]
+            self._leave(owner)
 
     def generation(self) -> int:
         """The newest generation given out. The removal fence."""
@@ -370,6 +430,8 @@ class Keeper:
     ) -> sqlite3.Row:
         """The row, then the blob: a failure before the blob leaves no blob
         without a row. Under the lock, so no delete of the same bytes runs between."""
+        if self._is_removed(owner):
+            raise _removed()
         now = self.now()
         file_id = _new_id("file-")
         connection.execute(
@@ -582,6 +644,8 @@ class Keeper:
                         f"declared {upload['bytes']}.",
                     )
                 self._part_bytes[upload_id] = flying + size
+                self._part_owner[upload_id] = owner
+                self._enter(owner)
         try:
             written = self.blobs.write_temp(chunks)
             try:
@@ -603,6 +667,8 @@ class Keeper:
                 self._part_bytes[upload_id] -= size
                 if not self._part_bytes[upload_id]:
                     del self._part_bytes[upload_id]
+                    self._part_owner.pop(upload_id, None)
+            self._leave(owner)
 
     def complete_upload(
         self,
@@ -629,6 +695,7 @@ class Keeper:
                         "again when that has finished.",
                     )
                 self._assembling.add(upload_id)
+                self._enter(owner)
             rows = {
                 row["id"]: row
                 for row in self.database.connection.execute(
@@ -640,6 +707,7 @@ class Keeper:
         finally:
             with self._guard:
                 self._assembling.discard(upload_id)
+            self._leave(owner)
 
     def _complete(
         self,
@@ -825,32 +893,73 @@ class Keeper:
             Blobs.discard(stale)
         return counts
 
-    def remove_owners(self, owners: list[str], *, fence: int) -> SweepCounts:
-        """Delete everything these owners kept up to generation `fence`, here and
-        in every `.bak` copy. What they kept after the fence was read (a person
-        restored under the same id, verified again since) stays."""
-        counts = SweepCounts()
-        if not owners:
-            return counts
-        for owner in owners:
-            self.check_owner(owner)
-            counts.add(self._delete_where("owner = ? AND generation <= ?", (owner, fence)))
+    def delete_removed(
+        self,
+        owner: str,
+        *,
+        marker: int | None = None,
+        force: bool = False,
+        fence: int | None = None,
+    ) -> SweepCounts | None:
+        """Delete a removed person's objects: rows, blobs and every `.bak` copy.
+
+        Compare-and-delete: only the marker the caller saw (`marker`), and only when
+        its date has passed (or `force`, the owner's Delete now); None when the
+        marker is gone, replaced or not yet due. Waits for the owner's writes under
+        way (they refuse at commit, the owner being hidden). The marker is the retry
+        record and goes last: a copy that cannot be purged raises, naming it, and
+        the marker stays for the next sweep. What was kept after `fence` stays."""
+        self.check_owner(owner)
+        now = self.now()
         with self.database.transaction() as connection:
-            connection.executemany(
-                "DELETE FROM removed WHERE owner = ?", [(owner,) for owner in owners]
+            row = connection.execute("SELECT * FROM removed WHERE owner = ?", (owner,)).fetchone()
+            if row is None:
+                if marker is None:
+                    raise StoreProblem(
+                        404, "Not removed", f"{owner} is not a person Eugene removed."
+                    )
+                return None
+            if marker is not None and row["marker"] != marker:
+                return None
+            if force:
+                connection.execute(
+                    "UPDATE removed SET delete_at = MIN(delete_at, ?) WHERE owner = ?", (now, owner)
+                )
+            elif row["delete_at"] > now:
+                return None
+            marker = int(row["marker"])
+        if not self._wait_idle(owner):
+            raise StoreProblem(
+                503,
+                "Writes under way",
+                f"{owner} still has an upload being written here. Nothing was deleted; "
+                "the next sweep tries again.",
             )
-        self.database.purge_backups(owners)
+        if fence is None:
+            fence = self.generation()
+        counts = self._delete_where("owner = ? AND generation <= ?", (owner, fence))
+        try:
+            self.database.purge_backups([owner])
+        except BackupPurgeFailed as exc:
+            raise StoreProblem(
+                503,
+                "Copy not purged",
+                f"{owner}'s files here are deleted, but a copy kept before a migration could "
+                f"not be purged: {exc}. They stay removed, and the next sweep tries again.",
+            ) from exc
+        with self.database.transaction() as connection:
+            connection.execute(
+                "DELETE FROM removed WHERE owner = ? AND marker = ?", (owner, marker)
+            )
         return counts
 
     def delete_now(self, owner: str) -> SweepCounts:
-        """The owner's Delete now for a removed person: everything they kept, at
-        once and for good, every copy (MRC27). Only a removed person: a person
-        Eugene still has keeps their files."""
-        self.check_owner(owner)
-        with self.database.lock:
-            if not self._is_removed(owner):
-                raise StoreProblem(404, "Not removed", f"{owner} is not a person Eugene removed.")
-            return self.remove_owners([owner], fence=self.generation())
+        """The owner's Delete now for a removed person: at once and for good, every
+        copy (MRC27). Only a removed person: a person Eugene still has keeps their
+        files (404)."""
+        counts = self.delete_removed(owner, force=True)
+        assert counts is not None
+        return counts
 
     # -- people and the console ----------------------------------------------
 
@@ -871,35 +980,48 @@ class Keeper:
         return found is not None
 
     def removed_people(self) -> dict[str, dict[str, int]]:
-        """Each hidden owner: when it was found removed, and its delete date."""
+        """Each hidden owner: when it was found removed, its delete date and its marker."""
         with self.database.lock:
             return {
-                row["owner"]: {"removedAt": row["found_at"], "deleteAt": row["delete_at"]}
+                row["owner"]: {
+                    "removedAt": row["found_at"],
+                    "deleteAt": row["delete_at"],
+                    "marker": row["marker"],
+                }
                 for row in self.database.connection.execute("SELECT * FROM removed")
             }
 
     def hide(self, owners: list[str], seconds: int) -> list[str]:
         """Hide these removed people now. Each one's date is fixed here, from the
-        setting now: a later change never shortens it."""
+        setting now: a later change never shortens it. The marker carries the
+        generation it was made at, for compare-and-delete."""
         now = self.now()
         hidden = []
         with self.database.transaction() as connection:
             for owner in owners:
                 self.check_owner(owner)
-                cursor = connection.execute(
-                    "INSERT OR IGNORE INTO removed (owner, found_at, delete_at) VALUES (?, ?, ?)",
-                    (owner, now, now + seconds),
+                if self._is_removed(owner):
+                    continue
+                connection.execute(
+                    "INSERT INTO removed (owner, found_at, delete_at, marker) VALUES (?, ?, ?, ?)",
+                    (owner, now, now + seconds, self._next_generation(connection)),
                 )
-                if cursor.rowcount:
-                    hidden.append(owner)
+                hidden.append(owner)
         return hidden
 
-    def restore(self, owners: list[str]) -> None:
-        """The root has these people again: everything they kept is theirs again."""
+    def restore(self, owners: list[str]) -> list[str]:
+        """The root has these people again: what they kept is theirs again, unless
+        their date has passed; a date that has passed is final."""
+        now = self.now()
+        restored = []
         with self.database.transaction() as connection:
-            connection.executemany(
-                "DELETE FROM removed WHERE owner = ?", [(owner,) for owner in owners]
-            )
+            for owner in owners:
+                cursor = connection.execute(
+                    "DELETE FROM removed WHERE owner = ? AND delete_at > ?", (owner, now)
+                )
+                if cursor.rowcount:
+                    restored.append(owner)
+        return restored
 
     def owners(self) -> dict[str, Any]:
         found: dict[str, dict[str, Any]] = {}
