@@ -34,7 +34,7 @@ from .problems import StoreProblem, not_found
 
 log = logging.getLogger(__name__)
 
-OWNER = re.compile(r"^(install|(person|key|service):[A-Za-z0-9._@:-]{1,200})$")
+OWNER = re.compile(r"^(install|(person|key|component):[A-Za-z0-9._@:-]{1,200})$")
 FILE_ID = re.compile(r"^file-[0-9a-f]{24}$")
 UPLOAD_ID = re.compile(r"^upload_[0-9a-f]{24}$")
 PART_ID = re.compile(r"^part_[0-9a-f]{24}$")
@@ -144,7 +144,7 @@ class Keeper:
             raise StoreProblem(
                 400,
                 "Bad owner",
-                "X-Eugene-Plexus-Owner must be install, person:<id>, key:<id> or service:<sub>.",
+                "X-Eugene-Plexus-Owner must be install, person:<id>, key:<id> or component:<sub>.",
             )
         return owner
 

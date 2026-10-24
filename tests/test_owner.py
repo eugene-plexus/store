@@ -125,3 +125,11 @@ def test_the_owners_console_sees_counts_and_never_content(
         ).status_code
         == 401
     )
+
+
+def test_only_the_four_owner_kinds_are_taken(as_owner: Callable[[str], Caller]) -> None:
+    for owner in ("install", "person:p-1", "key:k_1", "component:agent"):
+        assert as_owner(owner).upload(b"x").status_code == 201, owner
+    # `service:` was the audience prefix retired with the shared key.
+    for owner in ("service:agent", "person:", "person:a/b", "nobody"):
+        assert as_owner(owner).upload(b"x").status_code == 400, owner
