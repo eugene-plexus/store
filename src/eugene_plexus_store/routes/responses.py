@@ -163,7 +163,8 @@ async def add_conversation_items(
 ) -> JSONResponse:
     kept = _responses(request)
     async with _admitted(request, caller.owner):
-        body = await _json(request, ITEMS_BODY_BYTES)
+        # A turn kept with `store: false` adds all its items in this one call.
+        body = await _json(request, RESPONSE_BODY_BYTES)
         if set(body) != {"items"}:
             raise problem(400, "Bad body", "items: required, and the only field.")
         answer = await _call(kept.add_items, caller.owner, conversation_id, body["items"])
