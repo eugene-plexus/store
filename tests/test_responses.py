@@ -233,7 +233,8 @@ def test_a_conversation_carries_its_items_and_the_responses_kept_in_it(
     conversation = made.json()
     ident = conversation["id"]
     assert conversation["items"] == 1 and conversation["metadata"] == {"topic": "numbers"}
-    assert conversation["expiresAt"] == conversation["createdAt"] + 30 * DAY
+    # Kept until deleted, as OpenAI keeps conversations (no end by default).
+    assert "expiresAt" not in conversation
 
     clock.advance(DAY)
     first = keep(alice, "one", "uno", conversation=ident)
@@ -243,8 +244,6 @@ def test_a_conversation_carries_its_items_and_the_responses_kept_in_it(
     context = alice.get(f"/v1/conversations/{ident}/context").json()
     assert _texts(context["items"]) == ["Count with me.", "one", "uno", "two", "dos"]
     assert context["conversationId"] == ident
-    # Its last use moves its end.
-    assert alice.get(f"/v1/conversations/{ident}").json()["expiresAt"] == clock.now + 30 * DAY
 
     # input_items: the conversation's items before the response, then its own input.
     items = alice.get(f"/v1/responses/{second['id']}/input_items", params={"order": "asc"}).json()
@@ -283,7 +282,31 @@ def test_a_conversation_carries_its_items_and_the_responses_kept_in_it(
     assert alice.get(f"/v1/responses/{second['id']}").status_code == 200
 
 
-def test_a_conversation_ends_thirty_days_after_its_last_use(
+def test_a_conversation_is_kept_until_deleted_by_default(
+    client: TestClient,
+    as_owner: Callable[[str], Caller],
+    operator: dict[str, str],
+    clock: Clock,
+    settings: Settings,
+) -> None:
+    """OpenAI keeps a conversation until it is deleted, and so does Eugene by
+    default (full compatibility); a stored response still ends after 30 days."""
+    alice = as_owner("person:alice")
+    ident = alice.post("/v1/conversations", json={"items": [_message("user", "hi")]}).json()["id"]
+    assert keep(alice, "kept in it", "yes", conversation=ident).status_code == 201
+    clock.advance(400 * DAY)
+    assert alice.get(f"/v1/conversations/{ident}").status_code == 200
+    report = client.post("/v1/sweep", headers=operator).json()
+    assert report["conversations"] == 0 and report["responses"] == 1
+    assert _rows(settings, "conversations") == 1
+    assert _texts(alice.get(f"/v1/conversations/{ident}/context").json()["items"]) == [
+        "hi",
+        "kept in it",
+        "yes",
+    ]
+
+
+def test_with_the_setting_a_conversation_ends_days_after_its_last_use(
     client: TestClient,
     as_owner: Callable[[str], Caller],
     operator: dict[str, str],
@@ -291,17 +314,29 @@ def test_a_conversation_ends_thirty_days_after_its_last_use(
     settings: Settings,
 ) -> None:
     alice = as_owner("person:alice")
+    idle = alice.post("/v1/conversations", json={"items": [_message("user", "idle")]}).json()["id"]
     ident = alice.post("/v1/conversations", json={"items": [_message("user", "hi")]}).json()["id"]
     clock.advance(20 * DAY)
     assert keep(alice, "still here", "yes", conversation=ident).status_code == 201
-    clock.advance(20 * DAY)
-    assert alice.get(f"/v1/conversations/{ident}").status_code == 200
+    # The expert's setting applies to every conversation, from its last use: the
+    # one idle 20 days already has 10 left, whenever the setting was made.
+    patched = client.patch("/v1/config", headers=operator, json={"conversationDays": 30})
+    assert patched.json()["applied"] == ["conversationDays"]
+    shown = alice.get(f"/v1/conversations/{ident}").json()
+    assert shown["expiresAt"] == clock.now + 30 * DAY
     clock.advance(10 * DAY + 1)
+    assert alice.get(f"/v1/conversations/{idle}").status_code == 404
+    assert alice.get(f"/v1/conversations/{ident}").status_code == 200
+    clock.advance(20 * DAY)
     assert alice.get(f"/v1/conversations/{ident}").status_code == 404
     report = client.post("/v1/sweep", headers=operator).json()
-    assert report["conversations"] == 1
+    assert report["conversations"] == 2
     assert _rows(settings, "conversations") == 0
     assert _rows(settings, "conversation_items") == 0
+    # Back to never: nothing new ends.
+    client.patch("/v1/config", headers=operator, json={"conversationDays": None})
+    later = alice.post("/v1/conversations", json={}).json()
+    assert "expiresAt" not in later
 
 
 def test_items_must_name_an_id_and_twenty_at_a_time(as_owner: Callable[[str], Caller]) -> None:

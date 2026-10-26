@@ -99,13 +99,28 @@ FIELDS: list[ConfigField] = [
         description=(
             "How long a kept response is kept, then deleted for good. 30 is OpenAI's.\n\n"
             "A chat continued by `previous_response_id` is kept this long after its newest "
-            "response, and a conversation this long after its last use."
+            "response."
         ),
         category="responses",
         valueType=ConfigValueType.integer,
         default=30,
         minimum=1,
         maximum=365,
+    ),
+    ConfigField(
+        key="conversationDays",
+        label="Delete a conversation after (days)",
+        description=(
+            "How long a conversation is kept after its last use, then deleted for good with "
+            "its items.\n\n"
+            "0 keeps it until it is deleted, as OpenAI does. A number applies to every "
+            "conversation, counted from its last use, the ones kept before the change too."
+        ),
+        category="responses",
+        valueType=ConfigValueType.integer,
+        default=0,
+        minimum=0,
+        maximum=3650,
     ),
     ConfigField(
         key="ownerQuotaGiB",
@@ -322,9 +337,14 @@ class ConfigStore:
         return bool(self.get("responsesEnabled"))
 
     def response_seconds(self) -> int:
-        """How long a kept response is kept; a chain after its newest response, and a
-        conversation after its last use (row 54)."""
+        """How long a kept response is kept; a chain after its newest response (row 54)."""
         return int(self.get("responseDays")) * DAY
+
+    def conversation_seconds(self) -> int | None:
+        """How long a conversation is kept after its last use; None keeps it until it
+        is deleted, as OpenAI keeps one (the default)."""
+        days = int(self.get("conversationDays") or 0)
+        return days * DAY if days > 0 else None
 
     def default_seconds(self) -> int | None:
         """A file's life when its app names none; None keeps it until deleted."""

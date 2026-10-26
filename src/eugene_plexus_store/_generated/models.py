@@ -2183,8 +2183,9 @@ class StoredConversation(BaseModel):
     )
     id: str = Field(..., pattern='^conv_[0-9a-f]{48}$')
     createdAt: int
-    expiresAt: int = Field(
-        ..., description='Unix seconds, `responseDays` after its last use.'
+    expiresAt: int | None = Field(
+        None,
+        description='Unix seconds, `conversationDays` after its last use. Absent,\nthe conversation is kept until it is deleted (the default, as\nOpenAI keeps one).\n',
     )
     metadata: StoredMetadata
     items: int = Field(..., description='How many items it holds.')

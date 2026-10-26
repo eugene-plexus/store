@@ -926,6 +926,16 @@ class Keeper:
     def sweep(self) -> SweepCounts:
         """Delete what has ended, and anything on disk no row names."""
         now = self.now()
+        # Row 54: a conversation's end follows the setting in effect now, from its
+        # last use (none by default, as OpenAI keeps one); written first, so the
+        # clause below deletes what has ended.
+        seconds = self.config.conversation_seconds()
+        with self.database.transaction() as connection:
+            connection.execute(
+                "UPDATE conversations SET expires_at = CASE WHEN ? IS NULL THEN NULL "
+                "ELSE used_at + ? END",
+                (seconds, seconds),
+            )
         counts = self._delete_where(ENDED, (now,))
         with self.database.lock:
             connection = self.database.connection

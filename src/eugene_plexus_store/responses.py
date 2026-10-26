@@ -26,8 +26,14 @@ first, each one read for the owner; a link that was deleted breaks the
 chain, and the read says which one (409), rather than rebuild a
 conversation with a hole in it.
 
-**A conversation lives 30 days after its last use**: every item added and
-every response kept in it moves its end. Its items go with it.
+**A conversation is kept until it is deleted**, as OpenAI keeps one (Troy's
+standing rule: full compatibility by default). An expert may set
+`conversationDays`: then each one ends that many days after its last use
+(`used_at`: an item added, a response kept in it, its metadata changed),
+counted with the setting in effect now, for the ones kept before it was set
+too. Lookups read the end from `used_at` and the setting; the sweep writes it
+into `expires_at` first (`Keeper.sweep`), so row 53's clauses delete what has
+ended. Its items go with it.
 """
 
 from __future__ import annotations
@@ -161,12 +167,19 @@ class Responses:
             raise not_found("response", ident)
         return row
 
+    def _conversation_end(self, used_at: int) -> int | None:
+        """A conversation's end now: `conversationDays` after its last use, or none."""
+        seconds = self.keeper.config.conversation_seconds()
+        return None if seconds is None else used_at + seconds
+
     def _owned_conversation(self, owner: str, ident: str) -> sqlite3.Row:
         self.keeper.check_owner(owner)
         if CONVERSATION_ID.match(ident):
+            seconds = self.keeper.config.conversation_seconds()
             row = self.database.connection.execute(
-                f"SELECT * FROM conversations WHERE id = ? AND owner = ? AND {LIVE} AND {SHOWN}",
-                (ident, owner, self.keeper.now()),
+                f"SELECT * FROM conversations WHERE id = ? AND owner = ? AND {SHOWN} "
+                "AND (? IS NULL OR used_at + ? > ?)",
+                (ident, owner, seconds, seconds, self.keeper.now()),
             ).fetchone()
             if row is not None:
                 return row  # type: ignore[no-any-return]
@@ -195,13 +208,16 @@ class Responses:
         count = self.database.connection.execute(
             "SELECT COUNT(*) FROM conversation_items WHERE conversation_id = ?", (row["id"],)
         ).fetchone()[0]
-        return {
+        shown: dict[str, Any] = {
             "id": row["id"],
             "createdAt": row["created_at"],
-            "expiresAt": row["expires_at"],
             "metadata": json.loads(row["metadata"]),
             "items": int(count),
         }
+        ends = self._conversation_end(int(row["used_at"]))
+        if ends is not None:
+            shown["expiresAt"] = ends
+        return shown
 
     # -- responses -------------------------------------------------------------
 
@@ -440,12 +456,13 @@ class Responses:
             position += 1
             added += size
         connection.execute(
-            "UPDATE conversations SET next_position = ?, bytes = bytes + ?, expires_at = ?, "
-            "generation = ? WHERE id = ?",
+            "UPDATE conversations SET next_position = ?, bytes = bytes + ?, used_at = ?, "
+            "expires_at = ?, generation = ? WHERE id = ?",
             (
                 position,
                 added,
-                now + self._life(),
+                now,
+                self._conversation_end(now),
                 self.keeper._next_generation(connection),
                 conversation,
             ),
@@ -470,14 +487,16 @@ class Responses:
                 now = self.keeper.now()
                 connection.execute(
                     "INSERT INTO conversations (id, owner, metadata, bytes, next_position, "
-                    "created_at, expires_at, generation) VALUES (?, ?, ?, ?, 0, ?, ?, ?)",
+                    "created_at, used_at, expires_at, generation) "
+                    "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)",
                     (
                         ident,
                         owner,
                         encoded,
                         len(encoded.encode("utf-8")),
                         now,
-                        now + self._life(),
+                        now,
+                        self._conversation_end(now),
                         self.keeper._next_generation(connection),
                     ),
                 )
@@ -500,13 +519,15 @@ class Responses:
             if self.keeper._is_removed(owner):
                 raise _removed()
             was = len(row["metadata"].encode("utf-8"))
+            now = self.keeper.now()
             connection.execute(
-                "UPDATE conversations SET metadata = ?, bytes = bytes + ?, expires_at = ? "
-                "WHERE id = ?",
+                "UPDATE conversations SET metadata = ?, bytes = bytes + ?, used_at = ?, "
+                "expires_at = ? WHERE id = ?",
                 (
                     encoded,
                     len(encoded.encode("utf-8")) - was,
-                    self.keeper.now() + self._life(),
+                    now,
+                    self._conversation_end(now),
                     ident,
                 ),
             )

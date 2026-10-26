@@ -120,7 +120,8 @@ def _schema_2(connection: sqlite3.Connection) -> None:
     conversation's items are rows in order (`position`). Every table carries
     `owner` and the store's `generation`; responses and conversations an
     `expires_at`, so row 53's sweep, removal and quota clauses read them as
-    they read files."""
+    they read files. A conversation's `used_at` is its last use: its end,
+    when the owner sets one (`conversationDays`), is counted from it."""
     _run(
         connection,
         """
@@ -153,6 +154,7 @@ def _schema_2(connection: sqlite3.Connection) -> None:
             bytes INTEGER NOT NULL,
             next_position INTEGER NOT NULL,
             created_at INTEGER NOT NULL,
+            used_at INTEGER NOT NULL,
             expires_at INTEGER,
             generation INTEGER NOT NULL
         );
