@@ -35,7 +35,9 @@ async def store_status(request: Request) -> Any:
     keeper = _keeper(request)
     config: ConfigStore = request.app.state.config_store
     report = await run_in_threadpool(keeper.last_report)
-    answer: dict[str, Any] = {"parts": {"files": config.files_enabled()}}
+    answer: dict[str, Any] = {
+        "parts": {"files": config.files_enabled(), "responses": config.responses_enabled()}
+    }
     if report is not None:
         answer["lastSweep"] = report
     return answer

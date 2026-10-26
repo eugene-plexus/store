@@ -130,6 +130,8 @@ class SweepCounts:
     parts: int = 0
     blobs: int = 0
     freed_bytes: int = 0
+    responses: int = 0
+    conversations: int = 0
     unlink_later: list[str] = field(default_factory=list)
 
     def add(self, other: SweepCounts) -> None:
@@ -138,6 +140,8 @@ class SweepCounts:
         self.parts += other.parts
         self.blobs += other.blobs
         self.freed_bytes += other.freed_bytes
+        self.responses += other.responses
+        self.conversations += other.conversations
 
 
 class Keeper:
@@ -278,6 +282,12 @@ class Keeper:
             "WHERE owner = ? AND status = 'pending'",
             (owner,),
         ).fetchone()
+        # Row 54: kept responses and conversations count their bytes, not as files.
+        kept = connection.execute(
+            "SELECT (SELECT COALESCE(SUM(bytes), 0) FROM responses WHERE owner = ?) "
+            "+ (SELECT COALESCE(SUM(bytes), 0) FROM conversations WHERE owner = ?)",
+            (owner, owner),
+        ).fetchone()
         with self._guard:
             flying_files = self._reserved_files.get(owner, 0)
             flying_bytes = self._reserved_bytes.get(owner, 0)
@@ -297,14 +307,14 @@ class Keeper:
                 flying_bytes += size
         return (
             int(files[0]) + int(pending[0]) + flying_files,
-            int(files[1]) + int(pending[1]) + flying_bytes,
+            int(files[1]) + int(pending[1]) + flying_bytes + int(kept[0]),
         )
 
-    def _over(self, owner: str, adding: int) -> StoreProblem | None:
+    def _over(self, owner: str, adding: int, files: int = 1) -> StoreProblem | None:
         count, used = self._used(owner)
         most_files = self.config.quota_files()
         most_bytes = self.config.quota_bytes()
-        if count + 1 > most_files:
+        if files and count + files > most_files:
             return StoreProblem(
                 413,
                 "Over quota",
@@ -317,23 +327,27 @@ class Keeper:
                 "Over quota",
                 f"This owner keeps {_human(used)} ({used} bytes); this adds {_human(adding)} "
                 f"({adding} bytes), and the most it may keep is {_human(most_bytes)} "
-                f"({most_bytes} bytes) (Settings -> Store). Delete files it no longer needs.",
+                f"({most_bytes} bytes) (Settings -> Store). Delete "
+                + ("files" if files else "responses or conversations")
+                + " it no longer needs.",
             )
         return None
 
-    def _check_quota(self, owner: str, adding: int) -> None:
+    def _check_quota(self, owner: str, adding: int, files: int = 1) -> None:
         """Room for one more object of `adding` bytes, or the 413 with the numbers.
         An owner at its quota has its own ended objects deleted first. A removed
         person keeps nothing new, so no new object reclaims their hidden ones.
-        Called under the lock, outside any transaction."""
+        `files` is how many files it adds: none for a kept response or a
+        conversation (row 54), which count only their bytes. Called under the
+        lock, outside any transaction."""
         if self._is_removed(owner):
             raise _removed()
-        problem = self._over(owner, adding)
+        problem = self._over(owner, adding, files)
         if problem is None:
             return
         reclaimed = self._delete_where(f"owner = ? AND {ENDED}", (owner, self.now()))
-        if reclaimed.files or reclaimed.uploads:
-            problem = self._over(owner, adding)
+        if reclaimed.files or reclaimed.uploads or reclaimed.responses or reclaimed.conversations:
+            problem = self._over(owner, adding, files)
         if problem is not None:
             raise problem
 
@@ -892,6 +906,21 @@ class Keeper:
                 connection.execute("DELETE FROM uploads WHERE id = ?", (upload["id"],))
             counts.uploads = len(uploads)
             counts.add(self._release_blobs(connection, [row["sha256"] for row in files]))
+            # Row 54: stored responses, and conversations with their items, by the
+            # same clause (both carry owner, generation and expires_at).
+            counts.responses = connection.execute(
+                f"DELETE FROM responses WHERE {where}", values
+            ).rowcount
+            ended = [
+                row["id"]
+                for row in connection.execute(f"SELECT id FROM conversations WHERE {where}", values)
+            ]
+            for conversation in ended:
+                connection.execute(
+                    "DELETE FROM conversation_items WHERE conversation_id = ?", (conversation,)
+                )
+            connection.execute(f"DELETE FROM conversations WHERE {where}", values)
+            counts.conversations = len(ended)
         return counts
 
     def sweep(self) -> SweepCounts:
@@ -978,8 +1007,10 @@ class Keeper:
         with self.database.transaction() as connection:
             left = connection.execute(
                 "SELECT 1 FROM files WHERE owner = ? UNION ALL "
-                "SELECT 1 FROM uploads WHERE owner = ? LIMIT 1",
-                (owner, owner),
+                "SELECT 1 FROM uploads WHERE owner = ? UNION ALL "
+                "SELECT 1 FROM responses WHERE owner = ? UNION ALL "
+                "SELECT 1 FROM conversations WHERE owner = ? LIMIT 1",
+                (owner, owner, owner, owner),
             ).fetchone()
             if left is not None:
                 # Something newer than the fence survived: the person is back (a stale
@@ -1011,6 +1042,8 @@ class Keeper:
             rows = self.database.connection.execute(
                 "SELECT owner FROM files WHERE owner LIKE 'person:%' "
                 "UNION SELECT owner FROM uploads WHERE owner LIKE 'person:%' "
+                "UNION SELECT owner FROM responses WHERE owner LIKE 'person:%' "
+                "UNION SELECT owner FROM conversations WHERE owner LIKE 'person:%' "
                 "UNION SELECT owner FROM removed WHERE state = 'hidden' ORDER BY 1"
             ).fetchall()
         return [row[0] for row in rows]
@@ -1070,21 +1103,37 @@ class Keeper:
 
     def owners(self) -> dict[str, Any]:
         found: dict[str, dict[str, Any]] = {}
+
+        def entry(owner: str) -> dict[str, Any]:
+            return found.setdefault(
+                owner,
+                {
+                    "owner": owner,
+                    "files": 0,
+                    "bytes": 0,
+                    "uploads": 0,
+                    "responses": 0,
+                    "conversations": 0,
+                },
+            )
+
         with self.database.lock:
             connection = self.database.connection
             for row in connection.execute(
                 "SELECT owner, COUNT(*), COALESCE(SUM(bytes), 0) FROM files GROUP BY owner"
             ):
-                found[row[0]] = {"owner": row[0], "files": row[1], "bytes": row[2], "uploads": 0}
-            for row in connection.execute(
-                "SELECT owner, COUNT(*), COALESCE(SUM(bytes), 0) FROM uploads "
-                "WHERE status = 'pending' GROUP BY owner"
+                entry(row[0]).update(files=row[1], bytes=row[2])
+            # Each kind counted the same way: never a name, a purpose or content.
+            for table, count in (
+                ("uploads WHERE status = 'pending'", "uploads"),
+                ("responses", "responses"),
+                ("conversations", "conversations"),
             ):
-                entry = found.setdefault(
-                    row[0], {"owner": row[0], "files": 0, "bytes": 0, "uploads": 0}
-                )
-                entry["uploads"] = row[1]
-                entry["bytes"] += row[2]
+                for row in connection.execute(
+                    f"SELECT owner, COUNT(*), COALESCE(SUM(bytes), 0) FROM {table} GROUP BY owner"
+                ):
+                    entry(row[0])[count] = row[1]
+                    entry(row[0])["bytes"] += row[2]
             blob_bytes = connection.execute(
                 "SELECT COALESCE(SUM(bytes), 0) FROM "
                 "(SELECT sha256, MAX(bytes) AS bytes FROM files GROUP BY sha256)"
@@ -1125,6 +1174,8 @@ def report_of(counts: SweepCounts, *, at: float, removal: dict[str, Any] | None)
         "parts": counts.parts,
         "blobs": counts.blobs,
         "freedBytes": counts.freed_bytes,
+        "responses": counts.responses,
+        "conversations": counts.conversations,
     }
     if removal is not None:
         report["removal"] = removal

@@ -40,7 +40,7 @@ def test_files_turned_off_are_refused_naming_the_setting(
     # What was kept stays readable until it ends.
     assert alice.get(f"/v1/files/{kept}/content").content == b"before"
     status = client.get("/v1/store/status", headers=operator).json()
-    assert status["parts"] == {"files": False}
+    assert status["parts"] == {"files": False, "responses": True}
 
 
 def test_the_default_life_follows_the_setting(
@@ -80,4 +80,41 @@ def test_a_migration_keeps_a_copy_first(tmp_path: Path) -> None:
         second.close()
     finally:
         database.MIGRATIONS = migrations
+    assert (folder / f"store.sqlite3.schema-{len(migrations)}.bak").is_file()
+
+
+def test_a_row_53_store_gains_the_response_tables_and_keeps_its_files(tmp_path: Path) -> None:
+    """Schema 1 (row 53) moves to schema 2 (row 54) in place, a copy kept first,
+    and the files it held are still there."""
+    import sqlite3
+
+    from eugene_plexus_store import database
+
+    folder = tmp_path / "store"
+    migrations = database.MIGRATIONS
+    database.MIGRATIONS = migrations[:1]
+    try:
+        first = database.Database(folder)
+        first.open()
+        first.connection.execute(
+            "INSERT INTO files (id, owner, filename, purpose, bytes, mime_type, sha256, "
+            "created_at, expires_at, generation) VALUES "
+            "('file-1', 'person:a', 'n', 'user_data', 1, 'text/plain', 's', 1, NULL, 1)"
+        )
+        first.close()
+    finally:
+        database.MIGRATIONS = migrations
+    second = database.Database(folder)
+    second.open()
+    try:
+        assert second.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert second.connection.execute("SELECT id FROM files").fetchone()[0] == "file-1"
+        assert second.connection.execute("SELECT COUNT(*) FROM responses").fetchone()[0] == 0
+    finally:
+        second.close()
     assert (folder / "store.sqlite3.schema-1.bak").is_file()
+    copy = sqlite3.connect(folder / "store.sqlite3.schema-1.bak")
+    try:
+        assert copy.execute("SELECT id FROM files").fetchone()[0] == "file-1"
+    finally:
+        copy.close()

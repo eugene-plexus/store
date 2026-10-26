@@ -21,6 +21,7 @@ from .routes import admin as admin_routes
 from .routes import config as config_routes
 from .routes import files as files_routes
 from .routes import health as health_routes
+from .routes import responses as responses_routes
 from .routes import store as store_routes
 from .settings import Settings, load_settings
 from .sweeper import Sweeper
@@ -120,6 +121,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(health_routes.router)
     app.include_router(files_routes.router)
+    app.include_router(responses_routes.router)
     app.include_router(store_routes.router)
     operator_only = [Depends(require_operator)]
     app.include_router(config_routes.router, dependencies=operator_only)

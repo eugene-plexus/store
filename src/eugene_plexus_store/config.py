@@ -41,6 +41,7 @@ MIN_REMOVED_DAYS, MAX_REMOVED_DAYS = 1, 365
 
 CATEGORY_LABELS: dict[str, str] = {
     "files": "Files",
+    "responses": "Responses and conversations",
     "quotas": "Space per owner",
     "people": "Removed people",
     "logging": "Logging",
@@ -76,11 +77,43 @@ FIELDS: list[ConfigField] = [
         maximum=3650,
     ),
     ConfigField(
+        key="responsesEnabled",
+        label="Keep responses when apps ask (store: true)",
+        description=(
+            "Apps that use OpenAI's Responses API can ask Eugene to keep each answer "
+            "(`store: true`, OpenAI's default) and continue a chat by naming the last answer "
+            "(`previous_response_id`) or a conversation (`/v1/conversations`). What a person "
+            "or an app key keeps is theirs alone: the owner of this install sees only counts.\n\n"
+            "Off: nothing new is kept, `store: true` is named as ignored, and a request that "
+            "continues a kept answer or a conversation is refused with a message that says the "
+            "owner turned it off. What is already kept stays until it ends, and its owner can "
+            "still read and delete it."
+        ),
+        category="responses",
+        valueType=ConfigValueType.boolean,
+        default=True,
+    ),
+    ConfigField(
+        key="responseDays",
+        label="Delete a kept response after (days)",
+        description=(
+            "How long a kept response is kept, then deleted for good. 30 is OpenAI's.\n\n"
+            "A chat continued by `previous_response_id` is kept this long after its newest "
+            "response, and a conversation this long after its last use."
+        ),
+        category="responses",
+        valueType=ConfigValueType.integer,
+        default=30,
+        minimum=1,
+        maximum=365,
+    ),
+    ConfigField(
         key="ownerQuotaGiB",
         label="Space per owner (GiB)",
         description=(
-            "The most one person, app key or console may keep, files and uploads in "
-            "progress together. An upload past it is refused with the numbers."
+            "The most one person, app key or console may keep: files, uploads in progress, "
+            "kept responses and conversations together. What would pass it is refused with "
+            "the numbers."
         ),
         category="quotas",
         valueType=ConfigValueType.integer,
@@ -284,6 +317,14 @@ class ConfigStore:
 
     def files_enabled(self) -> bool:
         return bool(self.get("filesEnabled"))
+
+    def responses_enabled(self) -> bool:
+        return bool(self.get("responsesEnabled"))
+
+    def response_seconds(self) -> int:
+        """How long a kept response is kept; a chain after its newest response, and a
+        conversation after its last use (row 54)."""
+        return int(self.get("responseDays")) * DAY
 
     def default_seconds(self) -> int | None:
         """A file's life when its app names none; None keeps it until deleted."""

@@ -111,12 +111,83 @@ def _schema_1(connection: sqlite3.Connection) -> None:
     )
 
 
+def _schema_2(connection: sqlite3.Connection) -> None:
+    """Row 54: stored responses, conversations and their items.
+
+    A response keeps the items its own request sent (`input`), what it made
+    (`output`) and the response object without its output (`body`), as JSON;
+    a chain is its `previous_id` links, whose first is `root_id`. A
+    conversation's items are rows in order (`position`). Every table carries
+    `owner` and the store's `generation`; responses and conversations an
+    `expires_at`, so row 53's sweep, removal and quota clauses read them as
+    they read files."""
+    _run(
+        connection,
+        """
+        CREATE TABLE responses (
+            id TEXT PRIMARY KEY,
+            owner TEXT NOT NULL,
+            model TEXT NOT NULL,
+            status TEXT NOT NULL,
+            previous_id TEXT,
+            root_id TEXT NOT NULL,
+            depth INTEGER NOT NULL,
+            conversation_id TEXT,
+            conversation_position INTEGER,
+            input TEXT NOT NULL,
+            output TEXT NOT NULL,
+            body TEXT NOT NULL,
+            instructions INTEGER NOT NULL,
+            bytes INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER,
+            generation INTEGER NOT NULL
+        );
+        CREATE INDEX responses_by_owner ON responses(owner);
+        CREATE INDEX responses_by_end ON responses(expires_at);
+        CREATE INDEX responses_by_previous ON responses(previous_id);
+        CREATE TABLE conversations (
+            id TEXT PRIMARY KEY,
+            owner TEXT NOT NULL,
+            metadata TEXT NOT NULL,
+            bytes INTEGER NOT NULL,
+            next_position INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER,
+            generation INTEGER NOT NULL
+        );
+        CREATE INDEX conversations_by_owner ON conversations(owner);
+        CREATE INDEX conversations_by_end ON conversations(expires_at);
+        CREATE TABLE conversation_items (
+            conversation_id TEXT NOT NULL,
+            id TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            item TEXT NOT NULL,
+            bytes INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (conversation_id, id)
+        );
+        CREATE INDEX conversation_items_in_order ON conversation_items(conversation_id, position);
+        CREATE INDEX conversation_items_by_owner ON conversation_items(owner)
+        """,
+    )
+
+
 #: Schema N is made by MIGRATIONS[N - 1]. Append; never edit one that shipped.
-MIGRATIONS: Sequence[Callable[[sqlite3.Connection], None]] = (_schema_1,)
+MIGRATIONS: Sequence[Callable[[sqlite3.Connection], None]] = (_schema_1, _schema_2)
 
 #: The tables that hold an owner's rows, for removal: from the database
 #: and from every `.bak` copy.
-OWNER_TABLES = ("files", "uploads", "parts", "removed")
+OWNER_TABLES = (
+    "files",
+    "uploads",
+    "parts",
+    "responses",
+    "conversations",
+    "conversation_items",
+    "removed",
+)
 
 
 def _connect(path: Path, timeout: float = 5.0) -> sqlite3.Connection:

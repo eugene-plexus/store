@@ -2021,6 +2021,175 @@ class StoredUploadCompleteRequest(BaseModel):
     )
 
 
+class StoredItem(BaseModel):
+    """
+    One item in OpenAI's shape (a message, a function call, its
+    output, reasoning, ...), as the gateway sent it. The store reads
+    only `id`, which is unique within its response or conversation.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    id: str = Field(..., max_length=128, min_length=1)
+    type: str | None = None
+
+
+class StoredResponseStatus(StrEnum):
+    """
+    How the response ended. A stream the client left is kept with what
+    was sent, `incomplete`.
+
+    """
+
+    completed = 'completed'
+    incomplete = 'incomplete'
+    failed = 'failed'
+    cancelled = 'cancelled'
+
+
+class StoredResponseRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(
+        ...,
+        description="The gateway's id for the response, which the client already has.",
+        pattern='^resp_[0-9a-f]{32}$',
+    )
+    model: str = Field(..., max_length=512)
+    status: StoredResponseStatus
+    previousResponseId: str | None = Field(
+        None, description='The response this one continues (its chain).', max_length=64
+    )
+    conversationId: str | None = Field(
+        None,
+        description='The conversation this response belongs to; its items are added to it.',
+        max_length=64,
+    )
+    input: list[StoredItem] = Field(
+        ...,
+        description="The items the request itself sent (not the chain's or the\nconversation's), each with an id.\n",
+        max_length=10000,
+    )
+    output: list[StoredItem] = Field(..., max_length=10000)
+    response: dict[str, Any] = Field(
+        ...,
+        description='The response object as the client was given it, without\n`output` (kept once, above). `GET` gives it back whole.\n',
+    )
+
+
+class StoredResponse(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str
+    model: str
+    status: StoredResponseStatus
+    createdAt: int = Field(..., description='Unix seconds.')
+    expiresAt: int = Field(
+        ...,
+        description='Unix seconds: `responseDays` after it was kept, or later when a\nresponse after it in its chain was kept later.\n',
+    )
+    rootId: str = Field(
+        ...,
+        description='The first response of its chain; its own id when it starts one.',
+    )
+    previousResponseId: str | None = None
+    conversationId: str | None = None
+    bytes: int = Field(
+        ..., description="What it holds, counted against the owner's quota."
+    )
+    response: dict[str, Any] | None = Field(
+        None, description='The response object, `output` included. Present on `GET`.'
+    )
+
+
+class StoredObjectDeleted(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str
+    deleted: Literal[True]
+
+
+class StoredItemList(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    data: list[StoredItem]
+    hasMore: bool
+
+
+class StoredItemsRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    items: list[StoredItem] = Field(
+        ...,
+        description="Added at the end, in order (OpenAI's 20 at a time).",
+        max_length=20,
+        min_length=1,
+    )
+
+
+class StoredContext(BaseModel):
+    """
+    The conversation so far, oldest first.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    items: list[StoredItem]
+    bytes: int
+    rootId: str | None = Field(None, description='For a chain, its first response.')
+    conversationId: str | None = Field(None, description='For a conversation, its id.')
+    hadInstructions: bool | None = Field(
+        None,
+        description="For a chain, whether the response named was made with\n`instructions`, which are not carried to the next (OpenAI's\nrule), so the door can say so.\n",
+    )
+
+
+class StoredMetadata(RootModel[dict[str, str]]):
+    """
+    OpenAI's metadata: 16 pairs at most, a key of at most 64
+    characters and a value of at most 512 (the gateway checks both).
+
+    """
+
+    root: dict[str, str] = Field(..., max_length=16)
+
+
+class StoredConversationRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    metadata: StoredMetadata | None = None
+    items: list[StoredItem] | None = Field(None, max_length=20)
+
+
+class StoredConversationUpdate(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    metadata: StoredMetadata | None
+
+
+class StoredConversation(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., pattern='^conv_[0-9a-f]{48}$')
+    createdAt: int
+    expiresAt: int = Field(
+        ..., description='Unix seconds, `responseDays` after its last use.'
+    )
+    metadata: StoredMetadata
+    items: int = Field(..., description='How many items it holds.')
+
+
 class StoreOwner(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -2031,9 +2200,11 @@ class StoreOwner(BaseModel):
     files: int
     bytes: int = Field(
         ...,
-        description="The bytes of the owner's files and of its uploads in progress.",
+        description="The bytes of the owner's files, its uploads in progress, its\nstored responses and its conversations.\n",
     )
     uploads: int = Field(..., description='Uploads in progress.')
+    responses: int | None = Field(None, description='Stored responses (row 54).')
+    conversations: int | None = Field(None, description='Conversations (row 54).')
     removedAt: int | None = Field(
         None,
         description='Unix seconds. Set for a person Eugene removed: their objects\nhave been hidden from everyone since then.\n',
@@ -2107,6 +2278,13 @@ class SweepReport(BaseModel):
     parts: int = Field(..., description='Upload parts deleted.')
     blobs: int = Field(..., description='Blob files unlinked.')
     freedBytes: int
+    responses: int | None = Field(
+        None, description='Stored responses deleted, ended or removed (row 54).'
+    )
+    conversations: int | None = Field(
+        None,
+        description='Conversations deleted, with their items, ended or removed (row 54).',
+    )
     removal: RemovalCheck | None = None
     error: str | None = Field(None, description='Why the sweep could not finish.')
 
@@ -2116,6 +2294,10 @@ class StoreParts(BaseModel):
         extra='forbid',
     )
     files: bool = Field(..., description='`/v1/files` and `/v1/uploads` keep files.')
+    responses: bool | None = Field(
+        None,
+        description='`/v1/responses` keeps responses when apps ask (`store: true`),\nand `/v1/conversations` keeps conversations (row 54,\n`responsesEnabled`).\n',
+    )
 
 
 class StoreStatus(BaseModel):
@@ -2781,7 +2963,7 @@ class MessageContent1(
         TextContentPart | ImageContentPart | InputAudioContentPart | FileContentPart
     ] = Field(
         ...,
-        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
+        description='Text, null for an assistant tool-call turn, or ordered content parts.\nImages ride on user messages and on tool results (the gateway carries\na tool\'s picture on the next user message). Audio and files ride on\nuser messages only.\n\nImages are inline PNG/JPEG only: the gateway\'s `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nTool pictures count toward these same limits. On all three gateway\ndoors (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`), when\ntool pictures exceed the image count or decoded-byte limits, the\ngateway keeps the newest tool pictures that fit. Each picture not\nattached becomes a note in its tool message naming the limit, for\nexample: "[A picture this tool returned is not attached: this request\nholds at most 12 pictures.]" (with the effective setting\'s value).\nA person\'s own pictures are never dropped; if they alone exceed a\nlimit, the request is a 400.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Remote URLs are never fetched, and a\n`file_id` is refused:\neach names a store this install does not have.\n',
         min_length=1,
     )
 
@@ -2836,7 +3018,7 @@ class Message(BaseModel):
     role: Role
     content: str | MessageContent1 | None = Field(
         None,
-        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
+        description='Text, null for an assistant tool-call turn, or ordered content parts.\nImages ride on user messages and on tool results (the gateway carries\na tool\'s picture on the next user message). Audio and files ride on\nuser messages only.\n\nImages are inline PNG/JPEG only: the gateway\'s `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nTool pictures count toward these same limits. On all three gateway\ndoors (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`), when\ntool pictures exceed the image count or decoded-byte limits, the\ngateway keeps the newest tool pictures that fit. Each picture not\nattached becomes a note in its tool message naming the limit, for\nexample: "[A picture this tool returned is not attached: this request\nholds at most 12 pictures.]" (with the effective setting\'s value).\nA person\'s own pictures are never dropped; if they alone exceed a\nlimit, the request is a 400.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Remote URLs are never fetched, and a\n`file_id` is refused:\neach names a store this install does not have.\n',
     )
     toolCalls: list[dict[str, Any]] | None = Field(
         None,
@@ -2844,7 +3026,7 @@ class Message(BaseModel):
     )
     toolCallId: str | None = Field(
         None,
-        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+        description="On a **tool** message: which call this is the result of.\nFor inference-driver requests, `content` carries text; the gateway\nmoves a tool's pictures to the next user message, labelled with\nthis id.\n",
     )
     reasoning: str | None = Field(
         None,
